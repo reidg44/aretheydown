@@ -273,3 +273,7 @@ Exit codes, so scripts can gate on upstream health:
 | `just check` | Lint + test (run before committing)            |
 
 CI (`.github/workflows/ci.yml`) runs `just check`, a Rust 1.88 build, and the prek hooks on every pull request and push to `main`.
+
+## License
+
+MIT. See `LICENSE`.

@@ -4,6 +4,8 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "TUI that shows the current status of GitHub, AWS, Azure, and other platforms"
+license = "MIT"
+repository = "https://github.com/reidg44/aretheydown"
 publish = false
 
 [dependencies]
