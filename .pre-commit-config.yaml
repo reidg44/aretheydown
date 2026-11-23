@@ -1,0 +1,38 @@
+# pre-commit config (run with prek, never pre-commit)
+# https://github.com/j178/prek
+#
+# Install: prek install -f
+# Run on everything: prek run --all-files
+
+repos:
+- repo: https://github.com/betterleaks/betterleaks
+  rev: v1.10.1
+  hooks:
+  - id: betterleaks
+
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-added-large-files
+    args: [ "--maxkb=500" ]
+  - id: check-yaml
+  - id: check-toml
+  - id: end-of-file-fixer
+  - id: mixed-line-ending
+  - id: trailing-whitespace
+
+# Same commands as `just lint`, so hooks and CI agree.
+- repo: local
+  hooks:
+  - id: cargo-fmt
+    name: cargo fmt
+    entry: cargo fmt --check
+    language: system
+    types: [ rust ]
+    pass_filenames: false
+  - id: cargo-clippy
+    name: cargo clippy
+    entry: cargo clippy --all-targets -- -D warnings
+    language: system
+    types: [ rust ]
+    pass_filenames: false

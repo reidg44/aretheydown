@@ -1,0 +1,103 @@
+# aretheydown config (optional).
+#
+# Copy this file to ~/.config/aretheydown/config.toml
+# (or $XDG_CONFIG_HOME/aretheydown/config.toml if that is set; the same
+# path on macOS, Linux, and Windows), or pass any path with --config <path>.
+# With no config file, aretheydown checks only its built-in platforms.
+#
+# Unknown keys are an error, so a typo is reported instead of ignored.
+
+# Built-in platforms to skip, by name (not case-sensitive). Hidden platforms
+# are neither fetched nor shown. Run `aretheydown --once` to see the names.
+# hide = ["Cloudflare"]
+
+# Extra vendors whose status page runs on Atlassian Statuspage. Add one
+# block per vendor, each starting with [[statuspage]]:
+#   name: how it is shown in the output (must be unique)
+#   url:  the status page's root URL (http or https). The app fetches
+#         <url>/api/v2/summary.json; you can also paste that full URL.
+#
+# To check a vendor works, open <url>/api/v2/summary.json in a browser: you
+# should see JSON. Not every vendor uses Statuspage (Slack and Datadog do not).
+
+# [[statuspage]]
+# name = "Vercel"
+# url = "https://www.vercel-status.com"
+
+# [[statuspage]]
+# name = "npm"
+# url = "https://status.npmjs.org"
+
+# [[statuspage]]
+# name = "Atlassian"
+# url = "https://status.atlassian.com"
+
+# To replace a built-in with your own entry, list it in `hide` and add a
+# block with the same name.
+
+# Your own endpoints, so the first screen answers "is it me or them?". Each
+# [[check]] is a plain GET, shown as a platform after the vendors:
+#   name:   how it is shown in the output (must be unique)
+#   url:    the URL to GET (http or https; redirects are followed)
+#   expect: the status code that means up (optional; default any 2xx)
+# Up shows as Operational ("Responding: HTTP 200 in 142 ms"); any other
+# status, no connection, or no answer within 9s is an Outage. The URL is
+# shown on screen and in --json, so it must not hold a secret (no tokens in
+# the query string).
+
+# [[check]]
+# name = "API"
+# url = "https://api.example.com/healthz"
+# expect = 200
+
+# AWS: count only events in the regions you use. Without this, every region
+# counts, so a long-running event in a region you never touch keeps AWS red.
+# Use region codes (us-east-1, eu-west-2, us-gov-west-1), not names. Global
+# events (not tied to a region) always count. AWS shows how many events in
+# other regions it left out.
+# [aws]
+# regions = ["us-east-1", "us-west-2"]
+
+# Statuspage platforms (GitHub, Cloudflare, OpenAI, Anthropic, and any
+# [[statuspage]] vendor): count only the components you use. Key = platform
+# name (not case-sensitive); value = component or group names as the status
+# page shows them (not case-sensitive). A group name ("North America") covers
+# every component in it. With a list, the platform's level comes from those
+# components and the incidents touching them, not the vendor's overall status;
+# incidents that list no components always count. The description says how
+# many incidents on other components it left out, and names any listed
+# component the feed doesn't have (vendors rename them). Not for AWS, Azure,
+# Google Cloud, or Microsoft 365 (for AWS, use [aws] regions).
+# [components]
+# GitHub = ["Actions", "Packages"]
+
+# Probes: every refresh, one GET of each vendor's own service (not its status
+# page), shown next to the vendor's level as a check mark or cross. A probe
+# never changes the level, verdict, exit code, history, or alerts. Every
+# built-in has one (README -> Probes lists them). Key = platform name (not
+# case-sensitive); value = false (no probe) or a table with:
+#   url:    the URL to GET (http or https; redirects are NOT followed)
+#   expect: the status that means up: a code (401) or a class ("3xx"); a url
+#           without expect expects any 2xx, expect alone keeps the built-in url
+# A [[statuspage]] vendor gets a probe only with a url here. The URL is shown
+# on screen and in --json, so it must not hold a secret.
+# [probes]
+# OpenAI = false
+# GitHub = { url = "https://api.github.com/", expect = "2xx" }
+# Vercel = { url = "https://vercel.com/", expect = "3xx" }
+
+# --serve only: POST a JSON alert to this webhook when a platform's level
+# changes (either way) and the new level holds for two polls in a row (about
+# 2 minutes). The body has a `text` field, so a Slack incoming webhook URL
+# works as is; other services can read `platform`, `from`, `to`, `at`, and
+# `incidents`. The URL is a secret (anyone holding it can post), so
+# aretheydown never prints it. The TUI and --once ignore this table.
+# `webhook` takes one URL or a list; each alert goes to every URL.
+# `levels` (optional) alerts only on changes into or out of the listed levels
+# (operational, degraded, outage, unknown): with ["outage"], Degraded → Outage
+# and Outage → Operational alert, Operational → Degraded does not. Leaving
+# out "unknown" keeps a feed that could not be read (Operational → Unknown)
+# from alerting.
+# [alerts]
+# webhook = ["https://hooks.slack.com/services/your/webhook/path", "http://127.0.0.1:9000/hook"]
+# levels = ["outage"]

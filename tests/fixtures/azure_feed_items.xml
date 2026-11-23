@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:a10="http://www.w3.org/2005/Atom"
+  version="2.0">
+  <channel xmlns:slash="http://purl.org/rss/1.0/modules/slash/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wfw="http://wellformedweb.org/CommentAPI/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <title>Azure Status</title>
+    <link>https://azure.status.microsoft/en-us/status/</link>
+    <description>Azure Status</description>
+    <language>en-us</language>
+    <lastBuildDate>Fri, 13 Nov 2026 20:00:00 Z</lastBuildDate>
+    <item>
+      <guid isPermaLink="false">https://azure.status.microsoft/en-us/status/#TRK1-2M8</guid>
+      <link>https://azure.status.microsoft/en-us/status/</link>
+      <title>Active - Azure Front Door - Intermittent connectivity issues</title>
+      <description>&lt;p&gt;&lt;strong&gt;Impact Statement:&lt;/strong&gt; Starting at 17:42 UTC on 13 Nov 2026, a subset of customers using Azure Front Door may experience intermittent connectivity issues.&lt;/p&gt;</description>
+      <pubDate>Fri, 13 Nov 2026 18:15:27 Z</pubDate>
+      <a10:updated>2026-11-13T18:15:27Z</a10:updated>
+    </item>
+    <item>
+      <guid isPermaLink="false">https://azure.status.microsoft/en-us/status/#VLL0-3QZ</guid>
+      <link>https://azure.status.microsoft/en-us/status/</link>
+      <title>Mitigated - Virtual Machines - West Europe</title>
+      <description>&lt;p&gt;&lt;strong&gt;Summary of Impact:&lt;/strong&gt; Between 14:05 and 15:50 UTC on 13 Nov 2026, customers in West Europe may have seen failures starting Virtual Machines.&lt;/p&gt;</description>
+      <pubDate>Fri, 13 Nov 2026 16:02:09 +0000</pubDate>
+      <a10:updated>2026-11-13T16:02:09Z</a10:updated>
+    </item>
+  </channel>
+</rss>

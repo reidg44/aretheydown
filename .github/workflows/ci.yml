@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Same as running `just check` locally: fmt --check, clippy -D warnings, tests.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: just check
+
+  # The minimum Rust version (`rust-version` in Cargo.toml) still builds.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: rustc --version
+      - run: cargo build --locked --all-targets
+
+  # The prek hooks from .pre-commit-config.yaml. The two cargo hooks are
+  # skipped because the `check` job already runs them.
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
+        with:
+          extra-args: --all-files --skip cargo-fmt --skip cargo-clippy
+
+  # Secret scan of the commits themselves. The betterleaks hook above only
+  # checks staged changes, and nothing is staged in CI, so it scans nothing.
+  # PRs: the PR's commits (base..head). Pushes to main: the full history.
+  # Bumping betterleaks: AGENTS.md → Commands → CI.
+  secrets:
+    runs-on: ubuntu-latest
+    env:
+      BETTERLEAKS_VERSION: "1.10.1"
+      BETTERLEAKS_SHA256: c174b42d7aa60caf58c0c3e555c0e4bed01fe6b0d99a412bce777b5af4ce913e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check version matches the prek hook
+        run: |
+          # The `rev:` inside the betterleaks repo block, without quotes or a leading v.
+          hook_rev=$(awk '/repo:/ { in_block = /betterleaks\/betterleaks/ }
+            in_block && /rev:/ { gsub(/["'\'' ]|rev:/, ""); sub(/^v/, ""); print; exit }' .pre-commit-config.yaml)
+          if [ "$hook_rev" != "$BETTERLEAKS_VERSION" ]; then
+            echo "::error::BETTERLEAKS_VERSION is $BETTERLEAKS_VERSION but .pre-commit-config.yaml pins '${hook_rev:-nothing found}'"
+            exit 1
+          fi
+      - name: Install betterleaks
+        run: |
+          tarball="betterleaks_${BETTERLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/betterleaks/betterleaks/releases/download/v${BETTERLEAKS_VERSION}/$tarball"
+          echo "$BETTERLEAKS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/bin" betterleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Scan the PR's commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: betterleaks git --redact --verbose --no-banner --log-opts="$BASE_SHA..$HEAD_SHA" .
+      - name: Scan the full history
+        if: github.event_name == 'push'
+        run: betterleaks git --redact --verbose --no-banner .
