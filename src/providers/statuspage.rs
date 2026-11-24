@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::model::{
-    Incident, IncidentKind, Level, PastIncident, PlatformStatus, Update, non_blank,
-    resolved_recently, sort_newest_end_first,
+    ComponentNode, Incident, IncidentKind, Level, PastIncident, PlatformStatus, Update, name_key,
+    non_blank, resolved_recently, sort_newest_end_first,
 };
 
 #[derive(Deserialize)]
@@ -332,6 +332,8 @@ fn summary_status(
         .into_iter()
         .filter(RawMaintenance::is_active)
         .collect();
+    let components = known_components(&summary.components, &summary.incidents, &maintenances);
+    let tree = component_tree(&components);
     let status =
         |level, description, incidents: Vec<RawIncident>, maintenances: Vec<RawMaintenance>| {
             PlatformStatus {
@@ -348,6 +350,7 @@ fn summary_status(
                 error: None,
                 probe: None,
                 regions: Vec::new(),
+                component_tree: tree.clone(),
             }
         };
     let Some(watch) = watch else {
@@ -359,7 +362,6 @@ fn summary_status(
         );
     };
 
-    let components = known_components(&summary.components, &summary.incidents, &maintenances);
     let watch = Watch::new(watch, &components);
 
     let watched: Vec<&RawComponent> = components
@@ -488,7 +490,7 @@ fn known_components(
     incidents: &[RawIncident],
     maintenances: &[RawMaintenance],
 ) -> Vec<RawComponent> {
-    let key = |c: &RawComponent| c.id.clone().unwrap_or_else(|| normalize(&c.name));
+    let key = |c: &RawComponent| c.id.clone().unwrap_or_else(|| name_key(&c.name));
     let mut seen = HashSet::new();
     page.iter()
         .chain(incidents.iter().flat_map(|i| &i.components))
@@ -498,9 +500,52 @@ fn known_components(
         .collect()
 }
 
-/// Names match case-insensitively after trimming.
-fn normalize(name: &str) -> String {
-    name.trim().to_lowercase()
+/// The group `component` sits in, when that group is one of `group_ids`.
+fn in_group<'a>(component: &'a RawComponent, group_ids: &HashSet<&str>) -> Option<&'a str> {
+    component
+        .group_id
+        .as_deref()
+        .filter(|id| group_ids.contains(id))
+}
+
+/// `components` (from [`known_components`]) as the picker's tree: each group
+/// row where it sits, holding the components whose `group_id` is its `id`;
+/// every other component at the top level where it sits. Blank names are
+/// left out.
+fn component_tree(components: &[RawComponent]) -> Vec<ComponentNode> {
+    let group_ids: HashSet<&str> = components
+        .iter()
+        .filter(|c| c.group)
+        .filter_map(|c| c.id.as_deref())
+        .collect();
+    let mut members: HashMap<&str, Vec<String>> = HashMap::new();
+    for component in components.iter().filter(|c| !c.group) {
+        if let Some(id) = in_group(component, &group_ids)
+            && !component.name.trim().is_empty()
+        {
+            members.entry(id).or_default().push(component.name.clone());
+        }
+    }
+    components
+        .iter()
+        .filter(|c| !c.name.trim().is_empty())
+        .filter_map(|c| {
+            if c.group {
+                let components =
+                    c.id.as_deref()
+                        .and_then(|id| members.remove(id))
+                        .unwrap_or_default();
+                Some(ComponentNode::Group {
+                    name: c.name.clone(),
+                    components,
+                })
+            } else if in_group(c, &group_ids).is_some() {
+                None
+            } else {
+                Some(ComponentNode::Component(c.name.clone()))
+            }
+        })
+        .collect()
 }
 
 /// The watched names, and every component's name by id so a component's
@@ -515,10 +560,10 @@ impl<'a> Watch<'a> {
     fn new(names: &'a [String], components: &[RawComponent]) -> Self {
         let names_by_id = components
             .iter()
-            .filter_map(|c| Some((c.id.clone()?, normalize(&c.name))))
+            .filter_map(|c| Some((c.id.clone()?, name_key(&c.name))))
             .collect();
         Self {
-            names: names.iter().map(|n| normalize(n)).collect(),
+            names: names.iter().map(|n| name_key(n)).collect(),
             originals: names,
             names_by_id,
         }
@@ -532,7 +577,7 @@ impl<'a> Watch<'a> {
             .and_then(|id| self.names_by_id.get(id));
         self.names
             .iter()
-            .any(|n| *n == normalize(&component.name) || Some(n) == group)
+            .any(|n| *n == name_key(&component.name) || Some(n) == group)
     }
 
     /// An incident or maintenance counts when it lists no components or any
@@ -546,7 +591,7 @@ impl<'a> Watch<'a> {
         self.names
             .iter()
             .zip(self.originals)
-            .filter(|(n, _)| !components.iter().any(|c| normalize(&c.name) == **n))
+            .filter(|(n, _)| !components.iter().any(|c| name_key(&c.name) == **n))
             .map(|(_, original)| original.trim())
             .collect()
     }

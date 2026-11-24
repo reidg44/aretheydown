@@ -29,7 +29,7 @@ The right pane shows the selected platform, in this order:
 | PageUp/PageDown or `K`/`J`   | Scroll a long incident list. The pane border shows `↑ more` or `↓ more` when there is more to see. |
 | Tab and Shift-Tab            | Move a highlight through the selected platform's incidents. It starts on the first and wraps at the ends. |
 | `o`                          | Open the highlighted incident in your default browser. If the incident has no link, or there are no incidents, it opens the platform's status page. If the browser can't be opened, the footer says why for a few seconds. |
-| `f`                          | Filter the selected platform: on AWS, opens the region picker (see below). On any other platform, the footer says it can't be filtered. |
+| `f`                          | Filter the selected platform: on AWS, opens the region picker; on a Statuspage platform (GitHub, Cloudflare, OpenAI, Anthropic, or a vendor you added), opens the component picker (both below). On any other platform, the footer says it can't be filtered. |
 | `s`                          | Switch between worst-first order (the default: Outage, Unknown, Degraded, then Operational) and config order |
 | `t`                          | Open or close the timeline |
 | `r`                          | Refresh now |
@@ -62,6 +62,40 @@ It lists every AWS region, plus any region code in your config or in the live AW
 Enter writes the ticked regions to `[aws] regions` in the config file the screen loaded (`--config <path>`, else the default path; see [Config file](config.md)). It reads the file again first, so edits made since the screen started are kept, and it changes only the `regions` line: comments and other sections stay as they were. With no config file, it creates one holding only `[aws] regions`. With nothing ticked, it removes `regions` (and an `[aws]` header left empty), so every region counts again. The footer says where the file was written, and the screen fetches again at once with the new regions.
 
 If the save fails (the file can't be written, or it no longer parses), the file stays as it was, the old regions stay in force, and the footer says why for a few seconds.
+
+## Component picker
+
+Select a Statuspage platform and press `f` to choose which of its components count, instead of editing `[components]` in the config by hand. The checklist lists the components in the platform's latest feed, with each group as a heading:
+
+```text
+┌ Cloudflare components ────────────────────────────── 2 of 24 ticked ┐
+│> [x]   Old One                           not in feed                │
+│  [ ] ▸ Cloudflare Sites and Services     3 components               │
+│  [ ]   Arica, Chile - (ARI)                                         │
+│  [x] ▾ North America                     2 components               │
+│      [~] Albuquerque, United States - (ABQ)  covered by its group   │
+│      [~] Boston, United States - (BOS)       covered by its group   │
+```
+
+- Groups start closed. Components in no group sit at the top level.
+- Ticking a group saves the group's name, which covers every component in it, now and later. Its components show `[~]`. Unticking one of them unticks the group and ticks the rest of its components instead.
+- To tick single components, open the group (Right, or Enter on a closed group) and tick them. Left closes it again.
+- The names in your `[components]` entry for the platform start ticked. A name that isn't in the feed (a vendor may have renamed it) is listed first, marked `not in feed`, and stays ticked, so saving keeps it unless you untick it.
+- The list includes components that only show up on an active incident or maintenance, the same ones `[components]` can match.
+
+| Key                     | What it does |
+| ----------------------- | ------------ |
+| Up/Down or `j`/`k`      | Move |
+| Right / Left            | Open / close the group under the cursor. Left on a component closes its group. |
+| Space                   | Tick or untick the group or component |
+| `/`                     | Type a filter: it matches component and group names, in any case. A matching component shows under its group, even a closed one. |
+| Enter                   | On a closed group: open it. Anywhere else (or on a group the filter already shows matches under): save and close. The footer says which. |
+| Esc                     | Clear the filter, or, with none, close without saving |
+| `q` or Ctrl-C           | Quit |
+
+Enter writes the ticked names to the platform's `[components]` entry (`GitHub = ["Git Operations", "Actions"]`), in the order shown, with the feed's spelling. Like the region picker, it reads the file again first, changes only that entry, creates the file if there is none, and the screen fetches again at once: the platform's line then reads like `All 2 watched components operational`. With nothing ticked, it removes the entry (and a `[components]` table left empty), so every component counts again.
+
+If the platform has no data yet (its first fetch is still running) or its last fetch failed, `f` says so in the footer instead of opening an empty list.
 
 ## History section
 

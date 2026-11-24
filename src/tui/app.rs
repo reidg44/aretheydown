@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::picker::{Item, Outcome, Picker};
 use crate::history::Record;
-use crate::model::{Incident, Level, PlatformStatus, sort_worst_first};
+use crate::model::{ComponentNode, Incident, Level, PlatformStatus, name_key, sort_worst_first};
 use crate::providers::aws;
 
 /// Something the user asked for with a key press.
@@ -46,9 +46,31 @@ pub enum Effect {
     Open(String),
     /// Show this message in the footer for a few seconds.
     Notice(String),
-    /// Write these region codes to the config's `[aws] regions` (none
-    /// removes it), then refetch with them.
-    SaveAwsRegions(Vec<String>),
+    /// Write a picker's choices to the config file, then refetch with them.
+    Save(Pick),
+}
+
+/// What a filter picker saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// For `[aws] regions` (none removes it).
+    AwsRegions(Vec<String>),
+    /// For `platform`'s `[components]` entry (none removes it).
+    Components {
+        platform: String,
+        names: Vec<String>,
+    },
+}
+
+impl Pick {
+    /// The chosen keys, whichever filter they are for.
+    #[must_use]
+    pub fn keys(&self) -> &[String] {
+        match self {
+            Self::AwsRegions(codes) => codes,
+            Self::Components { names, .. } => names,
+        }
+    }
 }
 
 /// What `f` can filter on a platform.
@@ -59,6 +81,9 @@ pub enum Filter {
     None,
     /// AWS, with the `[aws] regions` in force (`None`: every region).
     AwsRegions(Option<Vec<String>>),
+    /// A Statuspage platform, with its `[components]` entry in force
+    /// (`None`: every component).
+    Components(Option<Vec<String>>),
 }
 
 /// The order of the platform list.
@@ -220,6 +245,15 @@ impl Entry {
     }
 }
 
+/// The filter picker while it is open, and what it saves to.
+#[derive(Debug, Clone)]
+struct OpenPicker {
+    picker: Picker,
+    /// The Statuspage platform whose `[components]` it picks; `None` for
+    /// the AWS region picker.
+    components_of: Option<String>,
+}
+
 /// Everything the TUI shows, independent of how it is drawn.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -251,7 +285,7 @@ pub struct App {
     /// The timeline as last drawn, for its page size and end.
     timeline_viewport: DetailViewport,
     /// The filter picker, while it replaces the list and detail pane.
-    picker: Option<Picker>,
+    picker: Option<OpenPicker>,
     quit: bool,
 }
 
@@ -303,18 +337,24 @@ impl App {
     /// React to a key press: the picker takes every key while it is open;
     /// otherwise the key's [`Action`] is applied.
     pub fn key(&mut self, key: KeyEvent) -> Option<Effect> {
-        let Some(picker) = &mut self.picker else {
+        let Some(open) = &mut self.picker else {
             return Action::from_key(key).and_then(|action| self.apply(action));
         };
-        match picker.key(key) {
+        match open.picker.key(key) {
             Outcome::Stay => None,
             Outcome::Cancel => {
                 self.picker = None;
                 None
             }
-            Outcome::Save(codes) => {
-                self.picker = None;
-                Some(Effect::SaveAwsRegions(codes))
+            Outcome::Save(keys) => {
+                let components_of = self.picker.take().and_then(|open| open.components_of);
+                Some(Effect::Save(match components_of {
+                    Some(platform) => Pick::Components {
+                        platform,
+                        names: keys,
+                    },
+                    None => Pick::AwsRegions(keys),
+                }))
             }
             Outcome::Quit => {
                 self.quit = true;
@@ -396,7 +436,7 @@ impl App {
         let entry = self.selected_entry()?;
         match &entry.filter {
             Filter::None => Some(Effect::Notice(format!(
-                "{} can't be filtered (only AWS regions can be picked)",
+                "{} can't be filtered (only AWS regions and Statuspage components can be picked)",
                 entry.name
             ))),
             Filter::AwsRegions(regions) => {
@@ -405,7 +445,37 @@ impl App {
                     .as_ref()
                     .map_or(&[][..], |status| &status.regions);
                 let items = region_items(regions.as_deref(), feed);
-                self.picker = Some(Picker::new("AWS regions", "regions", items));
+                self.picker = Some(OpenPicker {
+                    picker: Picker::new("AWS regions", "regions", items),
+                    components_of: None,
+                });
+                None
+            }
+            Filter::Components(names) => {
+                let name = entry.name.clone();
+                let status = match &entry.status {
+                    None => {
+                        return Some(Effect::Notice(format!(
+                            "{name}'s components aren't known yet: its first fetch is still running"
+                        )));
+                    }
+                    Some(status) if status.error.is_some() => {
+                        return Some(Effect::Notice(format!(
+                            "{name}'s components aren't known: its last fetch failed (r to retry)"
+                        )));
+                    }
+                    Some(status) => status,
+                };
+                let items = component_items(names.as_deref(), &status.component_tree);
+                if items.is_empty() {
+                    return Some(Effect::Notice(format!(
+                        "{name}'s feed lists no components to pick"
+                    )));
+                }
+                self.picker = Some(OpenPicker {
+                    picker: Picker::new(&format!("{name} components"), "components", items),
+                    components_of: Some(name),
+                });
                 None
             }
         }
@@ -414,7 +484,7 @@ impl App {
     /// The filter picker, while it is open.
     #[must_use]
     pub fn picker(&self) -> Option<&Picker> {
-        self.picker.as_ref()
+        self.picker.as_ref().map(|open| &open.picker)
     }
 
     /// Set what `f` filters on the platform named `name`.
@@ -723,11 +793,7 @@ pub fn region_items(configured: Option<&[String]>, feed: &[String]) -> Vec<Item>
     let ticked = |code: &str| configured.iter().any(|c| c.eq_ignore_ascii_case(code));
     let mut items: Vec<Item> = aws::REGIONS
         .iter()
-        .map(|&(code, name)| Item {
-            key: code.to_owned(),
-            label: name.to_owned(),
-            ticked: ticked(code),
-        })
+        .map(|&(code, name)| Item::new(code, name, ticked(code)))
         .collect();
     let extras = configured
         .iter()
@@ -736,11 +802,62 @@ pub fn region_items(configured: Option<&[String]>, feed: &[String]) -> Vec<Item>
     for (code, label) in extras {
         let code = code.to_ascii_lowercase();
         if !items.iter().any(|item| item.key == code) {
-            items.push(Item {
-                ticked: ticked(&code),
-                key: code,
-                label: label.to_owned(),
-            });
+            items.push(Item::new(&code, label, ticked(&code)));
+        }
+    }
+    items
+}
+
+/// A Statuspage platform's component picker items: any name in `configured`
+/// that names nothing in `tree` first (hint `not in feed`, ticked, so a save
+/// keeps it), then `tree` in feed order, each group a heading with its
+/// components under it. Names in `configured` start ticked, matched as the
+/// `[components]` matcher does (trimmed, any case); a group's name covers
+/// its components.
+#[must_use]
+pub fn component_items(configured: Option<&[String]>, tree: &[ComponentNode]) -> Vec<Item> {
+    let normalize = name_key;
+    let configured: Vec<(&String, String)> = configured
+        .unwrap_or_default()
+        .iter()
+        .map(|name| (name, normalize(name)))
+        .collect();
+    let ticked = |name: &str| {
+        let name = normalize(name);
+        configured.iter().any(|(_, c)| *c == name)
+    };
+    let in_feed = |name: &str| {
+        tree.iter()
+            .flat_map(ComponentNode::names)
+            .any(|n| normalize(n) == name)
+    };
+    let mut items: Vec<Item> = Vec::new();
+    for (name, normalized) in &configured {
+        let listed = items.iter().any(|item| normalize(&item.key) == *normalized);
+        if !listed && !in_feed(normalized) {
+            let mut item = Item::new(name.trim(), "", true);
+            "not in feed".clone_into(&mut item.hint);
+            items.push(item);
+        }
+    }
+    for node in tree {
+        match node {
+            ComponentNode::Group { name, components } => {
+                let heading = items.len();
+                let mut item = Item::new(name, "", ticked(name));
+                item.heading = true;
+                item.hint = match components.len() {
+                    1 => "1 component".to_owned(),
+                    n => format!("{n} components"),
+                };
+                items.push(item);
+                for component in components {
+                    let mut item = Item::new(component, "", ticked(component));
+                    item.parent = Some(heading);
+                    items.push(item);
+                }
+            }
+            ComponentNode::Component(name) => items.push(Item::new(name, "", ticked(name))),
         }
     }
     items
@@ -768,6 +885,7 @@ mod tests {
             error: None,
             probe: None,
             regions: Vec::new(),
+            component_tree: Vec::new(),
         }
     }
 
@@ -1751,7 +1869,7 @@ mod tests {
         assert_eq!(
             effect,
             Some(Effect::Notice(format!(
-                "{name} can't be filtered (only AWS regions can be picked)"
+                "{name} can't be filtered (only AWS regions and Statuspage components can be picked)"
             )))
         );
         assert!(app.picker().is_none());
@@ -1769,10 +1887,10 @@ mod tests {
         app.key(key(KeyCode::Char(' ')));
         assert_eq!(
             app.key(key(KeyCode::Enter)),
-            Some(Effect::SaveAwsRegions(vec![
+            Some(Effect::Save(Pick::AwsRegions(vec![
                 "us-east-1".into(),
                 "xx-config-1".into()
-            ]))
+            ])))
         );
         assert!(app.picker().is_none(), "saving closes the picker");
 
@@ -1854,5 +1972,187 @@ mod tests {
                 .ticked
         );
         assert!(region_items(None, &[]).iter().all(|item| !item.ticked));
+    }
+
+    fn fixture(name: &str, body: &[u8], watch: Option<&[String]>) -> PlatformStatus {
+        crate::providers::statuspage::parse_watching(name, body, Utc::now(), watch).unwrap()
+    }
+
+    const GITHUB: &[u8] = include_bytes!("../../tests/fixtures/github_summary.json");
+    const CLOUDFLARE: &[u8] = include_bytes!("../../tests/fixtures/cloudflare_summary.json");
+
+    /// GitHub and Cloudflare from their fixtures, GitHub watching `watch`.
+    fn components_app(watch: &[&str]) -> App {
+        let watch: Vec<String> = watch.iter().map(|&n| n.to_owned()).collect();
+        let watch = (!watch.is_empty()).then_some(watch);
+        let mut app = App::new(vec!["GitHub".into(), "Cloudflare".into()]);
+        app.set_filter("GitHub", Filter::Components(watch.clone()));
+        app.set_filter("Cloudflare", Filter::Components(None));
+        app.finish_refresh(
+            vec![
+                fixture("GitHub", GITHUB, watch.as_deref()),
+                fixture("Cloudflare", CLOUDFLARE, None),
+            ],
+            Utc::now(),
+        );
+        app.sort = SortOrder::Config;
+        app.reorder();
+        app.select(0);
+        assert_eq!(app.selected_row().unwrap().0, "GitHub");
+        app
+    }
+
+    fn keys(app: &App) -> Vec<(String, bool)> {
+        let picker = app.picker().unwrap();
+        picker
+            .visible()
+            .iter()
+            .map(|&i| (picker.items()[i].key.clone(), picker.items()[i].ticked))
+            .collect()
+    }
+
+    #[test]
+    fn f_on_github_opens_its_components_with_the_configured_names_ticked() {
+        let mut app = components_app(&["webhooks", " Actions ", "Gone Away"]);
+        assert_eq!(app.key(key(KeyCode::Char('f'))), None);
+        let picker = app.picker().unwrap();
+        assert_eq!(picker.title(), "GitHub components");
+        let shown = keys(&app);
+        assert_eq!(shown.len(), 13, "12 components and one not in the feed");
+        assert_eq!(shown[0], ("Gone Away".to_owned(), true));
+        assert_eq!(picker.items()[0].hint, "not in feed");
+        assert_eq!(shown[1], ("Git Operations".to_owned(), false));
+        assert_eq!(shown[2], ("Webhooks".to_owned(), true));
+        assert!(shown.contains(&("Actions".to_owned(), true)));
+
+        // Untick Webhooks, tick Git Operations: the feed's spelling, tree order.
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ] {
+            app.key(key(code));
+        }
+        assert_eq!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::Save(Pick::Components {
+                platform: "GitHub".into(),
+                names: vec![
+                    "Gone Away".into(),
+                    "Git Operations".into(),
+                    "Actions".into()
+                ],
+            }))
+        );
+        assert!(app.picker().is_none());
+    }
+
+    #[test]
+    fn a_name_not_in_the_feed_is_dropped_only_when_unticked() {
+        let mut app = components_app(&["Gone Away"]);
+        app.key(key(KeyCode::Char('f')));
+        app.key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::Save(Pick::Components {
+                platform: "GitHub".into(),
+                names: Vec::new(),
+            }))
+        );
+    }
+
+    #[test]
+    fn cloudflare_groups_are_headings_and_the_filter_keeps_their_names() {
+        let mut app = components_app(&[]);
+        app.apply(Action::Down);
+        app.key(key(KeyCode::Char('f')));
+        let shown = keys(&app);
+        assert_eq!(shown.len(), 18, "2 collapsed groups and 16 ungrouped");
+        assert_eq!(shown[0].0, "Cloudflare Sites and Services");
+        assert_eq!(shown[17].0, "North America");
+        let picker = app.picker().unwrap();
+        assert!(picker.items()[0].heading);
+        assert_eq!(picker.items()[0].hint, "3 components");
+
+        for c in "/boston".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            keys(&app)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["North America", "Boston, United States - (BOS)"]
+        );
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::Save(Pick::Components {
+                platform: "Cloudflare".into(),
+                names: vec!["North America".into()],
+            })),
+            "ticking a group saves the group's name"
+        );
+    }
+
+    #[test]
+    fn a_configured_group_starts_ticked_and_covers_its_components() {
+        let mut app = App::new(vec!["Cloudflare".into()]);
+        let watch = vec!["north america".to_owned()];
+        app.set_filter("Cloudflare", Filter::Components(Some(watch.clone())));
+        app.finish_refresh(
+            vec![fixture("Cloudflare", CLOUDFLARE, Some(&watch))],
+            Utc::now(),
+        );
+        app.key(key(KeyCode::Char('f')));
+        let picker = app.picker().unwrap();
+        let heading = picker
+            .items()
+            .iter()
+            .position(|item| item.key == "North America")
+            .unwrap();
+        assert!(picker.items()[heading].ticked);
+        assert!(picker.covered(heading + 1));
+        assert_eq!(picker.picked(), ["North America"]);
+    }
+
+    #[test]
+    fn f_without_a_good_summary_shows_a_notice() {
+        let mut app = App::new(vec!["GitHub".into()]);
+        app.set_filter("GitHub", Filter::Components(None));
+        assert_eq!(
+            app.key(key(KeyCode::Char('f'))),
+            Some(Effect::Notice(
+                "GitHub's components aren't known yet: its first fetch is still running".into()
+            ))
+        );
+        app.finish_refresh(
+            vec![PlatformStatus::unknown("GitHub", "timed out", Utc::now())],
+            Utc::now(),
+        );
+        assert_eq!(
+            app.key(key(KeyCode::Char('f'))),
+            Some(Effect::Notice(
+                "GitHub's components aren't known: its last fetch failed (r to retry)".into()
+            ))
+        );
+        assert!(app.picker().is_none());
+    }
+
+    #[test]
+    fn kept_stale_data_still_gives_the_component_tree() {
+        let mut app = App::new(vec!["GitHub".into()]);
+        app.set_filter("GitHub", Filter::Components(None));
+        let now = Utc::now();
+        app.finish_refresh(vec![fixture("GitHub", GITHUB, None)], now);
+        app.finish_refresh(
+            vec![PlatformStatus::unknown("GitHub", "timed out", now)],
+            now,
+        );
+        assert!(app.row_stale(0).is_some());
+        assert_eq!(app.key(key(KeyCode::Char('f'))), None);
+        assert_eq!(app.picker().unwrap().items().len(), 12);
     }
 }

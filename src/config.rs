@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -556,7 +557,7 @@ fn validated_aws_regions(codes: &[String]) -> Result<Vec<String>> {
 
 /// Built-in platform names match `hide` entries regardless of case.
 fn same_name(a: &str, b: &str) -> bool {
-    a.trim().to_lowercase() == b.trim().to_lowercase()
+    crate::model::name_key(a) == crate::model::name_key(b)
 }
 
 /// `text` as an http(s) URL with a host, or what is wrong with it. The
@@ -678,131 +679,296 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
 /// Fails when `text` is not a valid config, or the edited text would not be
 /// one. No message repeats a value from the file (it may hold a webhook URL).
 pub fn with_aws_regions(text: &str, regions: &[String]) -> Result<String> {
-    parse(text)?;
-    // `parse` accepted it, so this only fails on a difference between the two
-    // parsers; toml_edit's message quotes the line, so it is not passed on.
-    let document = toml_edit::Document::parse(text)
-        .map_err(|_| anyhow!("the file could not be read for editing"))?;
-    let edited = match find_aws_regions(&document) {
-        Some(found) => found.apply(text, regions),
-        None if regions.is_empty() => text.to_owned(),
-        None => {
-            let mut edited = text.to_owned();
-            if !edited.is_empty() && !edited.ends_with('\n') {
-                edited.push('\n');
-            }
-            if !edited.trim().is_empty() {
-                edited.push('\n');
-            }
-            edited.push_str("[aws]\n");
-            edited.push_str(&regions_line(regions));
-            edited.push('\n');
-            edited
-        }
-    };
-    check_edited(&edited, regions)?;
+    let before = parse(text)?;
+    let edited = set_list(text, "aws", |key| key == "regions", "regions", regions)?;
+    check_edited(&before, &edited, |config| {
+        config.aws.regions = (!regions.is_empty()).then(|| regions.to_vec());
+    })?;
     Ok(edited)
 }
 
-/// `regions = ["us-east-1", "us-west-2"]`, with no newline.
-fn regions_line(regions: &[String]) -> String {
-    let codes: Vec<String> = regions.iter().map(|code| format!("{code:?}")).collect();
-    format!("regions = [{}]", codes.join(", "))
+/// `text`, a config file's contents, with `platform`'s `[components]` entry
+/// set to `names` (written in that order). The entry is found by its key in
+/// any case, as [`apply`] matches it, and keeps that key as written; a new
+/// one is keyed by `platform`. Only the entry's list changes (one line, like
+/// [`with_aws_regions`]); other entries, comments, and sections stay. An
+/// empty `names` removes the entry, and a `[components]` table it leaves
+/// empty, so every component counts again.
+///
+/// # Errors
+///
+/// Fails when `text` is not a valid config, or the edited text would not be
+/// one (a name that is not a platform, say). No message repeats a value from
+/// the file.
+pub fn with_components(text: &str, platform: &str, names: &[String]) -> Result<String> {
+    let before = parse(text)?;
+    let existing = before
+        .components
+        .keys()
+        .find(|key| same_name(key, platform))
+        .cloned();
+    let edited = set_list(
+        text,
+        "components",
+        |key| same_name(key, platform),
+        &toml_key(platform),
+        names,
+    )?;
+    check_edited(&before, &edited, |config| {
+        config.components.retain(|key, _| !same_name(key, platform));
+        if !names.is_empty() {
+            let key = existing.unwrap_or_else(|| platform.to_owned());
+            config.components.insert(key, names.to_vec());
+        }
+    })?;
+    Ok(edited)
 }
 
-/// Where `[aws] regions` sits in a parsed config file, as byte ranges.
-enum AwsRegionsAt {
-    /// An `[aws]` header with no `regions` under it (the range is the header).
-    EmptyTable(std::ops::Range<usize>),
-    /// `aws = { }` with no `regions` (the range is the `{ … }` value).
-    EmptyInline(std::ops::Range<usize>),
-    /// A `regions = […]` key and value, from the key to the end of the value.
-    /// `header` is the `[aws]` header it sits under, if it sits under one;
-    /// `line` is the whole `aws = { … }` line it is part of, if inline.
+/// `text` with the list under the key `is_key` finds in the top-level
+/// table `table` set to `values` (one line), or removed when `values` is
+/// empty, as [`with_aws_regions`] and [`with_components`] describe. A new
+/// entry is written as `new_key = […]`, under the table's header, after its
+/// dotted keys, inside its inline table, or in a new `[table]` at the end.
+fn set_list(
+    text: &str,
+    table: &str,
+    is_key: impl Fn(&str) -> bool,
+    new_key: &str,
+    values: &[String],
+) -> Result<String> {
+    // The caller's `parse` accepted `text`, so this only fails on a difference
+    // between the two parsers; toml_edit's message quotes the line, so it is
+    // not passed on.
+    let document = toml_edit::Document::parse(text)
+        .map_err(|_| anyhow!("the file could not be read for editing"))?;
+    let list = toml_list(values);
+    let Some(found) = find_list(&document, table, is_key) else {
+        if values.is_empty() {
+            return Ok(text.to_owned());
+        }
+        let mut edited = text.to_owned();
+        if !edited.is_empty() && !edited.ends_with('\n') {
+            edited.push('\n');
+        }
+        if !edited.trim().is_empty() {
+            edited.push('\n');
+        }
+        let _ = writeln!(edited, "[{table}]\n{new_key} = {list}");
+        return Ok(edited);
+    };
+    found
+        .apply(text, table, new_key, &list, values.is_empty())
+        .ok_or_else(|| anyhow!("the file could not be edited safely; change [{table}] by hand"))
+}
+
+/// `["a", "b"]`, each value a TOML basic string.
+fn toml_list(values: &[String]) -> String {
+    let values: Vec<String> = values.iter().map(|value| toml_string(value)).collect();
+    format!("[{}]", values.join(", "))
+}
+
+/// `value` as a TOML basic string: quoted, with `"`, `\`, and control
+/// characters escaped.
+fn toml_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            c if c.is_control() => {
+                let _ = write!(quoted, "\\u{:04X}", u32::from(c));
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// `key` as a TOML key: bare when it can be, else quoted.
+fn toml_key(key: &str) -> String {
+    let bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if bare {
+        key.to_owned()
+    } else {
+        toml_string(key)
+    }
+}
+
+type Span = std::ops::Range<usize>;
+
+/// Where a list entry of a top-level table sits in a parsed file, or where a
+/// new one would go, as byte ranges.
+enum ListAt {
+    /// A `[table]` header without the entry. `last` is the end of its last
+    /// entry, or of the header when it has none.
+    Header { last: usize },
+    /// Dotted `table.key = …` lines without the entry; `last` is the end of
+    /// the last one.
+    Dotted { last: usize },
+    /// `table = { … }` without the entry: the `{ … }` value, and the end of
+    /// its last entry when it has one.
+    Inline { value: Span, last: Option<usize> },
+    /// The entry itself: its key and value, its value, and what it sits in.
     Key {
-        key_value: std::ops::Range<usize>,
-        header: Option<std::ops::Range<usize>>,
-        inline: Option<std::ops::Range<usize>>,
+        key_value: Span,
+        value: Span,
+        within: Within,
     },
 }
 
-/// Find `[aws] regions` in `document`; `None` when there is no `aws` key.
-fn find_aws_regions(document: &toml_edit::Document<&str>) -> Option<AwsRegionsAt> {
-    let (aws_key, aws) = document.as_table().get_key_value("aws")?;
-    let span = |key: &toml_edit::Key, item: &toml_edit::Item| -> Option<std::ops::Range<usize>> {
+/// What an existing entry sits in, for removing it.
+enum Within {
+    /// Under a `[table]` header (its range); `alone` when it is the only entry.
+    Header { header: Span, alone: bool },
+    /// A dotted `table.key = …` line.
+    Dotted,
+    /// An inline table: the whole `table = { … }`, and whether it is alone.
+    Inline { whole: Span, alone: bool },
+}
+
+/// Find the entry `is_key` names in the top-level table `table`; `None` when
+/// there is no such table.
+fn find_list(
+    document: &toml_edit::Document<&str>,
+    table: &str,
+    is_key: impl Fn(&str) -> bool,
+) -> Option<ListAt> {
+    let (table_key, item) = document.as_table().get_key_value(table)?;
+    let span = |key: &toml_edit::Key, item: &toml_edit::Item| -> Option<Span> {
         Some(key.span()?.start..item.span()?.end)
     };
-    match aws {
-        toml_edit::Item::Table(table) => {
-            let header = (!table.is_dotted()).then(|| table.span()).flatten();
-            match table.get_key_value("regions") {
-                Some((key, item)) => Some(AwsRegionsAt::Key {
+    match item {
+        toml_edit::Item::Table(found) => {
+            let names: Vec<&str> = found.iter().map(|(name, _)| name).collect();
+            let header = (!found.is_dotted()).then(|| found.span()).flatten();
+            if let Some(&name) = names.iter().find(|name| is_key(name)) {
+                let (key, item) = found.get_key_value(name)?;
+                let within = match header {
+                    Some(header) => Within::Header {
+                        header,
+                        alone: names.len() == 1,
+                    },
+                    None if found.is_dotted() => Within::Dotted,
+                    None => return None,
+                };
+                return Some(ListAt::Key {
                     key_value: span(key, item)?,
-                    header,
-                    inline: None,
+                    value: item.span()?,
+                    within,
+                });
+            }
+            let ends = names
+                .iter()
+                .filter_map(|name| found.get(name)?.span().map(|span| span.end));
+            match header {
+                Some(header) => Some(ListAt::Header {
+                    last: ends.chain([header.end]).max()?,
                 }),
-                None => header.map(AwsRegionsAt::EmptyTable),
+                None => Some(ListAt::Dotted { last: ends.max()? }),
             }
         }
-        toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => {
-            match table.get_key_value("regions") {
-                Some((key, item)) => Some(AwsRegionsAt::Key {
-                    key_value: span(key, item)?,
-                    header: None,
-                    inline: span(aws_key, aws),
-                }),
-                None => table.span().map(AwsRegionsAt::EmptyInline),
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(found)) => {
+            let names: Vec<&str> = found.iter().map(|(name, _)| name).collect();
+            if let Some(&name) = names.iter().find(|name| is_key(name)) {
+                let (key, entry) = found.get_key_value(name)?;
+                return Some(ListAt::Key {
+                    key_value: span(key, entry)?,
+                    value: entry.span()?,
+                    within: Within::Inline {
+                        whole: span(table_key, item)?,
+                        alone: names.len() == 1,
+                    },
+                });
             }
+            let last = names
+                .iter()
+                .filter_map(|name| found.get(name)?.span().map(|span| span.end))
+                .max();
+            Some(ListAt::Inline {
+                value: found.span()?,
+                last,
+            })
         }
         _ => None,
     }
 }
 
-impl AwsRegionsAt {
-    /// `text` with this place set to `regions`, or cleared when it is empty.
-    fn apply(self, text: &str, regions: &[String]) -> String {
-        let line = regions_line(regions);
-        let splice = |range: std::ops::Range<usize>, with: &str| {
+impl ListAt {
+    /// `text` with this place set to `list` (`key = list` for a new entry),
+    /// or the entry removed when `remove`. `None` when there is no safe way.
+    fn apply(self, text: &str, table: &str, key: &str, list: &str, remove: bool) -> Option<String> {
+        let splice = |range: Span, with: &str| {
             format!("{}{with}{}", &text[..range.start], &text[range.end..])
         };
-        match self {
-            Self::EmptyTable(_) | Self::EmptyInline(_) if regions.is_empty() => text.to_owned(),
-            Self::EmptyTable(header) => {
-                let after = line_end(text, header.end);
-                let newline = if text[..after].ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                };
-                splice(after..after, &format!("{newline}{line}\n"))
+        // A new line after the line holding byte `at`.
+        let add_line = |at: usize, line: &str| {
+            let after = line_end(text, at);
+            let newline = if text[..after].ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            splice(after..after, &format!("{newline}{line}\n"))
+        };
+        Some(match self {
+            Self::Header { .. } | Self::Dotted { .. } | Self::Inline { .. } if remove => {
+                text.to_owned()
             }
-            Self::EmptyInline(value) => splice(value, &format!("{{ {line} }}")),
-            Self::Key { key_value, .. } if !regions.is_empty() => splice(key_value, &line),
-            // `aws = { regions = […] }` holds nothing else: drop the line.
+            Self::Header { last } => add_line(last, &format!("{key} = {list}")),
+            Self::Dotted { last } => add_line(last, &format!("{table}.{key} = {list}")),
+            Self::Inline { value, last: None } => splice(value, &format!("{{ {key} = {list} }}")),
+            Self::Inline {
+                last: Some(end), ..
+            } => splice(end..end, &format!(", {key} = {list}")),
+            Self::Key { value, .. } if !remove => splice(value, list),
             Self::Key {
-                inline: Some(whole),
-                ..
-            } => splice(whole_lines(text, &whole), ""),
-            Self::Key {
-                key_value, header, ..
-            } => {
-                let removed = splice(whole_lines(text, &key_value), "");
-                // Only `regions` may sit under `[aws]`, so its header is left
-                // with nothing; it comes before the key, so its range holds.
-                match header {
-                    Some(header) => {
+                key_value, within, ..
+            } => match within {
+                Within::Header { header, alone } => {
+                    let removed = splice(whole_lines(text, &key_value), "");
+                    if alone {
+                        // The header comes before the entry, so its range holds.
                         let lines = whole_lines(&removed, &header);
                         format!("{}{}", &removed[..lines.start], &removed[lines.end..])
+                    } else {
+                        removed
                     }
-                    None => removed,
                 }
-            }
-        }
+                Within::Dotted => splice(whole_lines(text, &key_value), ""),
+                Within::Inline { whole, alone: true } => splice(whole_lines(text, &whole), ""),
+                Within::Inline { alone: false, .. } => splice(inline_entry(text, &key_value)?, ""),
+            },
+        })
     }
 }
 
+/// The bytes to cut to drop the inline-table entry at `key_value` and one
+/// comma beside it: the comma after it (and the spaces after that), or, for
+/// the last entry, the comma before it (and the spaces before the entry).
+fn inline_entry(text: &str, key_value: &Span) -> Option<Span> {
+    let after = &text[key_value.end..];
+    let gap = after.len() - after.trim_start().len();
+    if after[gap..].starts_with(',') {
+        let rest = &after[gap + 1..];
+        let spaces = rest.len() - rest.trim_start().len();
+        return Some(key_value.start..key_value.end + gap + 1 + spaces);
+    }
+    let before = text[..key_value.start].trim_end();
+    before
+        .strip_suffix(',')
+        .map(|kept| kept.len()..key_value.end)
+}
+
 /// The whole lines `range` touches, with the last one's newline.
-fn whole_lines(text: &str, range: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+fn whole_lines(text: &str, range: &Span) -> Span {
     line_start(text, range.start)..line_end(text, range.end)
 }
 
@@ -819,52 +985,70 @@ fn line_end(text: &str, at: usize) -> usize {
         .map_or(text.len(), |newline| at + newline + 1)
 }
 
-/// Check that `edited` still loads and sets exactly `regions`.
-fn check_edited(edited: &str, regions: &[String]) -> Result<()> {
+/// Check that `edited` still loads and says what `before` said with `set`
+/// applied, and nothing else changed.
+fn check_edited(before: &Config, edited: &str, set: impl FnOnce(&mut Config)) -> Result<()> {
     let config = parse(edited)?;
     apply(providers::builtin(), &config)
         .and_then(|_| alerts(&config))
         .map_err(|error| anyhow!("{}", redact_values(&format!("{error:#}"))))?;
-    let expected = (!regions.is_empty()).then(|| regions.to_vec());
-    if config.aws.regions != expected {
-        bail!("the file could not be edited safely; change [aws] regions by hand");
+    let mut expected = before.clone();
+    set(&mut expected);
+    if config != expected {
+        bail!("the file could not be edited safely; change it by hand");
     }
     Ok(())
 }
 
-/// What [`save_aws_regions`] did to the file.
+/// What [`save_aws_regions`] or [`save_components`] did to the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Saved {
     /// There was no file; it was created.
     Created,
     /// The file was rewritten.
     Updated,
-    /// The file already said that (or, with no regions, there was nothing
-    /// to remove), so it was left alone; a missing file stays missing.
+    /// The file already said that (or, with nothing picked, there was
+    /// nothing to remove), so it was left alone; a missing file stays missing.
     Unchanged,
 }
 
 /// Set `[aws] regions` in the config file at `path` ([`with_aws_regions`]),
-/// reading it fresh so edits made since it was loaded are kept. A missing
-/// file (and its directory) is created; a file that would not change is not
-/// written. The new text goes to `<file>.tmp`, created readable by its owner
-/// only (it may hold a webhook URL) and given the old file's mode, then is
-/// renamed over the file (the symlink's target, if `path` is one), so a
-/// failure leaves the file as it was.
+/// as [`save_edit`] writes it.
 ///
 /// # Errors
 ///
 /// Fails when the file cannot be read or written, or is not a valid config.
 /// The message names the file but never repeats a value from it.
 pub fn save_aws_regions(path: &Path, regions: &[String]) -> Result<Saved> {
+    save_edit(path, |text| with_aws_regions(text, regions))
+}
+
+/// Set `platform`'s `[components]` entry in the config file at `path`
+/// ([`with_components`]), as [`save_edit`] writes it.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read or written, or is not a valid config.
+/// The message names the file but never repeats a value from it.
+pub fn save_components(path: &Path, platform: &str, names: &[String]) -> Result<Saved> {
+    save_edit(path, |text| with_components(text, platform, names))
+}
+
+/// Rewrite the config file at `path` with `edit`, reading it fresh so edits
+/// made since it was loaded are kept. A missing file (and its directory) is
+/// created; a file that would not change is not written. The new text goes
+/// to `<file>.tmp`, created readable by its owner only (it may hold a webhook
+/// URL) and given the old file's mode, then is renamed over the file (the
+/// symlink's target, if `path` is one), so a failure leaves the file as it
+/// was.
+fn save_edit(path: &Path, edit: impl FnOnce(&str) -> Result<String>) -> Result<Saved> {
     let target = symlink_target(path);
     let (text, saved) = match std::fs::read_to_string(&target) {
         Ok(text) => (text, Saved::Updated),
         Err(error) if error.kind() == ErrorKind::NotFound => (String::new(), Saved::Created),
         Err(error) => bail!("could not read {}: {error}", path.display()),
     };
-    let edited =
-        with_aws_regions(&text, regions).with_context(|| format!("in {}", path.display()))?;
+    let edited = edit(&text).with_context(|| format!("in {}", path.display()))?;
     if edited == text && (saved == Saved::Updated || edited.is_empty()) {
         return Ok(Saved::Unchanged);
     }
@@ -2113,6 +2297,175 @@ GitHub = false
         );
         let mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a new file is readable by its owner only");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_components_changes_only_that_entry() {
+        let text = "# Mine.\n[components]\n# CI only.\ngithub = [\"Actions\"] # CI\nCloudflare = [\"Workers\"]\n\n[alerts]\nwebhook = \"https://hooks.example.com/services/T0/B0/s3cret\"\n";
+        let edited = with_components(text, "GitHub", &codes(&["Git Operations", "Pages"])).unwrap();
+        assert_eq!(
+            edited,
+            text.replace(
+                "github = [\"Actions\"] # CI",
+                "github = [\"Git Operations\", \"Pages\"] # CI"
+            )
+        );
+        let loaded = apply(providers::builtin(), &parse(&edited).unwrap()).unwrap();
+        assert_eq!(
+            watched(&loaded, "GitHub"),
+            Some(codes(&["Git Operations", "Pages"]))
+        );
+        assert_eq!(watched(&loaded, "Cloudflare"), Some(codes(&["Workers"])));
+    }
+
+    #[test]
+    fn a_new_components_entry_goes_after_the_others_or_in_a_new_table() {
+        let text = "[components]\nGitHub = [\"Actions\"]\n\n[aws]\nregions = [\"us-east-1\"]\n";
+        assert_eq!(
+            with_components(text, "Cloudflare", &codes(&["Workers"])).unwrap(),
+            "[components]\nGitHub = [\"Actions\"]\nCloudflare = [\"Workers\"]\n\n[aws]\nregions = [\"us-east-1\"]\n"
+        );
+        assert_eq!(
+            with_components("hide = []", "Cloudflare", &codes(&["Workers"])).unwrap(),
+            "hide = []\n\n[components]\nCloudflare = [\"Workers\"]\n"
+        );
+        assert_eq!(
+            with_components("[components] # mine\n", "OpenAI", &codes(&["API"])).unwrap(),
+            "[components] # mine\nOpenAI = [\"API\"]\n"
+        );
+    }
+
+    #[test]
+    fn a_vendor_name_with_spaces_is_quoted_and_names_are_escaped() {
+        let text = "[[statuspage]]\nname = \"My Vendor\"\nurl = \"https://status.example.com\"\n";
+        let edited = with_components(
+            text,
+            "My Vendor",
+            &codes(&["São Paulo, Brazil - (GRU)", "A \"B\" \\ C"]),
+        )
+        .unwrap();
+        assert_eq!(
+            edited,
+            format!(
+                "{text}\n[components]\n\"My Vendor\" = [\"São Paulo, Brazil - (GRU)\", \"A \\\"B\\\" \\\\ C\"]\n"
+            )
+        );
+        let loaded = apply(providers::builtin(), &parse(&edited).unwrap()).unwrap();
+        assert_eq!(
+            watched(&loaded, "My Vendor"),
+            Some(codes(&["São Paulo, Brazil - (GRU)", "A \"B\" \\ C"]))
+        );
+    }
+
+    #[test]
+    fn an_empty_pick_removes_the_entry_and_an_emptied_components_table() {
+        let text = "[components]\nGitHub = [\"Actions\"]\nCloudflare = [\"Workers\"]\n[aws]\nregions = [\"us-east-1\"]\n";
+        let one_left = with_components(text, "github", &[]).unwrap();
+        assert_eq!(
+            one_left,
+            "[components]\nCloudflare = [\"Workers\"]\n[aws]\nregions = [\"us-east-1\"]\n"
+        );
+        assert_eq!(
+            with_components(&one_left, "Cloudflare", &[]).unwrap(),
+            "[aws]\nregions = [\"us-east-1\"]\n"
+        );
+        // Nothing to remove: the text is returned as it was.
+        assert_eq!(with_components(&one_left, "GitHub", &[]).unwrap(), one_left);
+    }
+
+    #[test]
+    fn dotted_and_inline_components_are_edited_in_place() {
+        let dotted =
+            "components.GitHub = [\"Actions\"] # d\ncomponents.Cloudflare = [\"Workers\"]\n[aws]\n";
+        assert_eq!(
+            with_components(dotted, "GitHub", &codes(&["Pages"])).unwrap(),
+            "components.GitHub = [\"Pages\"] # d\ncomponents.Cloudflare = [\"Workers\"]\n[aws]\n"
+        );
+        assert_eq!(
+            with_components(dotted, "OpenAI", &codes(&["API"])).unwrap(),
+            "components.GitHub = [\"Actions\"] # d\ncomponents.Cloudflare = [\"Workers\"]\ncomponents.OpenAI = [\"API\"]\n[aws]\n"
+        );
+        assert_eq!(
+            with_components(dotted, "GitHub", &[]).unwrap(),
+            "components.Cloudflare = [\"Workers\"]\n[aws]\n"
+        );
+
+        let inline = "components = { GitHub = [\"Actions\"], Cloudflare = [\"Workers\"] } # i\n";
+        assert_eq!(
+            with_components(inline, "Cloudflare", &codes(&["DNS"])).unwrap(),
+            "components = { GitHub = [\"Actions\"], Cloudflare = [\"DNS\"] } # i\n"
+        );
+        assert_eq!(
+            with_components(inline, "OpenAI", &codes(&["API"])).unwrap(),
+            "components = { GitHub = [\"Actions\"], Cloudflare = [\"Workers\"], OpenAI = [\"API\"] } # i\n"
+        );
+        assert_eq!(
+            with_components(inline, "GitHub", &[]).unwrap(),
+            "components = { Cloudflare = [\"Workers\"] } # i\n"
+        );
+        assert_eq!(
+            with_components(inline, "Cloudflare", &[]).unwrap(),
+            "components = { GitHub = [\"Actions\"] } # i\n"
+        );
+        assert_eq!(
+            with_components(
+                "components = { GitHub = [\"A\"] }\nhide = []\n",
+                "GitHub",
+                &[]
+            )
+            .unwrap(),
+            "hide = []\n"
+        );
+        assert_eq!(
+            with_components("components = {}\n", "GitHub", &codes(&["A"])).unwrap(),
+            "components = { GitHub = [\"A\"] }\n"
+        );
+    }
+
+    #[test]
+    fn a_components_entry_the_config_rejects_is_not_written() {
+        // AWS is not a Statuspage platform; the edit is refused, not written.
+        let message = format!(
+            "{:#}",
+            with_components("", "AWS", &codes(&["EC2"])).unwrap_err()
+        );
+        assert!(message.contains("not a Statuspage platform"), "{message}");
+    }
+
+    #[test]
+    fn saving_components_round_trips_through_load() {
+        let dir = temp_dir("save-components");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        let picks = codes(&["Git Operations", "Webhooks"]);
+        assert_eq!(
+            save_components(&path, "GitHub", &picks).unwrap(),
+            Saved::Updated
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            COMMENTED.replace(
+                "GitHub = [\"Actions\"]   # CI",
+                "GitHub = [\"Git Operations\", \"Webhooks\"]   # CI"
+            )
+        );
+        let loaded = load(Some(&path)).unwrap();
+        assert_eq!(watched(&loaded.platforms, "GitHub"), Some(picks.clone()));
+        assert_eq!(
+            save_components(&path, "GitHub", &picks).unwrap(),
+            Saved::Unchanged
+        );
+        assert_eq!(
+            save_components(&path, "GitHub", &[]).unwrap(),
+            Saved::Updated
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[components]"), "{text}");
+        assert!(text.contains("# GitHub, only what I use.\n"), "{text}");
+        assert!(load(Some(&path)).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

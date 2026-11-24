@@ -200,6 +200,41 @@ pub struct PlatformStatus {
     /// Never serialized, so `--json` and history lines don't carry it.
     #[serde(skip)]
     pub regions: Vec<String>,
+    /// Statuspage only: every component the feed mentions, as groups with
+    /// their components and components in no group, in feed order, for the
+    /// TUI's component picker. Never serialized, like `regions`.
+    #[serde(skip)]
+    pub component_tree: Vec<ComponentNode>,
+}
+
+/// How component and platform names compare: trimmed, in any case.
+#[must_use]
+pub fn name_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+impl ComponentNode {
+    /// Its own name, then (for a group) its components' names.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        let (name, components) = match self {
+            Self::Group { name, components } => (name, &components[..]),
+            Self::Component(name) => (name, &[][..]),
+        };
+        std::iter::once(name.as_str()).chain(components.iter().map(String::as_str))
+    }
+}
+
+/// One top-level entry of a Statuspage platform's component list: a group
+/// and the components in it, or a component in no group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentNode {
+    /// A group (its name) and its components' names, in feed order.
+    Group {
+        name: String,
+        components: Vec<String>,
+    },
+    /// A component in no group.
+    Component(String),
 }
 
 /// The result of a platform's probe: a GET of the vendor's own front door
@@ -237,6 +272,7 @@ impl PlatformStatus {
             error: Some(error.into()),
             probe: None,
             regions: Vec::new(),
+            component_tree: Vec::new(),
         }
     }
 }
@@ -364,6 +400,7 @@ mod tests {
             error: Some("partial".to_owned()),
             probe: None,
             regions: Vec::new(),
+            component_tree: Vec::new(),
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: PlatformStatus = serde_json::from_str(&json).unwrap();
