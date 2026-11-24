@@ -80,6 +80,8 @@ The platform's line reads like `1 of 1 watched components not operational: Worke
 
 Without an entry, the platform shows the vendor's overall status.
 
+You can also pick the components on the interactive screen: select the platform and press `f` (see [Component picker](screen.md#component-picker)). The screen writes that platform's `[components]` entry, keyed by the platform's name, and changes nothing else in the file. Like the region picker, `--serve` uses the change after its next start.
+
 ## Probes: `[probes]`
 
 `[probes]` changes the [probes](probes.md).

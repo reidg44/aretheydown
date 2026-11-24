@@ -301,5 +301,6 @@ pub fn parse_in_regions(
         error: None,
         probe: None,
         regions: feed_regions,
+        component_tree: Vec::new(),
     })
 }

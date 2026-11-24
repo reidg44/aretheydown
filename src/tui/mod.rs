@@ -30,7 +30,7 @@ use crate::config::{self, Saved};
 use crate::model::PlatformStatus;
 use crate::providers::{Platform, Source};
 use crate::{fetch, history};
-use app::{App, DetailViewport, Effect, Filter, History};
+use app::{App, DetailViewport, Effect, Filter, History, Pick};
 
 /// How often the statuses refresh on their own.
 pub use crate::fetch::REFRESH_INTERVAL;
@@ -104,15 +104,20 @@ pub async fn run(
         }
     };
     // A small file, but the disk may be slow: write it off the async threads.
-    let save = move |codes: Vec<String>| {
+    let save = move |pick: Pick| {
         let path = config.clone();
         async move {
             let path = path.ok_or_else(|| {
                 anyhow!("there is no config file location (set HOME or XDG_CONFIG_HOME, or pass --config)")
             })?;
             tokio::task::spawn_blocking(move || {
-                let saved = config::save_aws_regions(&path, &codes)?;
-                Ok(saved_notice(&path, saved, codes.len()))
+                let saved = match &pick {
+                    Pick::AwsRegions(codes) => config::save_aws_regions(&path, codes)?,
+                    Pick::Components { platform, names } => {
+                        config::save_components(&path, platform, names)?
+                    }
+                };
+                Ok(saved_notice(&path, saved, &pick))
             })
             .await
             .context("the save stopped")?
@@ -137,9 +142,41 @@ pub async fn run(
     result
 }
 
+/// The footer notice after `pick` was saved to `path`.
+fn saved_notice(path: &Path, saved: Saved, pick: &Pick) -> String {
+    match pick {
+        Pick::AwsRegions(codes) => saved_regions_notice(path, saved, codes.len()),
+        Pick::Components { platform, names } => {
+            saved_components_notice(path, saved, platform, names.len())
+        }
+    }
+}
+
+/// The footer notice after [`config::save_components`] wrote `count` names
+/// to `platform`'s `[components]` entry in `path`.
+fn saved_components_notice(path: &Path, saved: Saved, platform: &str, count: usize) -> String {
+    let path = path.display();
+    let names = if count == 1 {
+        format!("1 {platform} component")
+    } else {
+        format!("{count} {platform} components")
+    };
+    match (saved, count) {
+        (Saved::Unchanged, 0) => {
+            format!(
+                "Every {platform} component already counts: {path} has no [components] entry for it"
+            )
+        }
+        (Saved::Unchanged, _) => format!("{path} already watches these {names}"),
+        (_, 0) => format!("Removed {platform} from [components] in {path}: every component counts"),
+        (Saved::Created, _) => format!("Created {path} watching {names}"),
+        (Saved::Updated, _) => format!("Saved {names} to {path}"),
+    }
+}
+
 /// The footer notice after [`config::save_aws_regions`] wrote `count`
 /// region codes to `path`.
-fn saved_notice(path: &Path, saved: Saved, count: usize) -> String {
+fn saved_regions_notice(path: &Path, saved: Saved, count: usize) -> String {
     let path = path.display();
     let regions = if count == 1 {
         "1 AWS region".to_owned()
@@ -157,34 +194,51 @@ fn saved_notice(path: &Path, saved: Saved, count: usize) -> String {
     }
 }
 
-/// Act on the outcome of saving the region picker's `codes`, returning the
-/// footer notice and whether to refetch. On success, every AWS platform takes
-/// the new regions (none: every region), and the refetch starts at once, even
-/// if a refresh is running. On failure, the old regions stay and the notice
-/// says why.
-fn apply_saved_regions(
+/// Act on the outcome of saving a picker's `pick`, returning the footer
+/// notice and whether to refetch. On success, every AWS platform takes the
+/// new regions (none: every region), or the picked Statuspage platform its
+/// new components (none: every component), and the refetch starts at once,
+/// even if a refresh is running. On failure, the old filter stays and the
+/// notice says why.
+fn apply_saved(
     app: &mut App,
     platforms: &mut [Platform],
-    codes: Vec<String>,
+    pick: Pick,
     saved: Result<String>,
 ) -> (String, bool) {
-    match saved {
-        Ok(message) => {
-            let regions = (!codes.is_empty()).then_some(codes);
-            for platform in platforms {
-                if let Source::Aws {
-                    regions: current, ..
-                } = &mut platform.source
-                {
-                    current.clone_from(&regions);
-                    app.set_filter(&platform.name, filter_for(platform));
-                }
-            }
-            app.start_refresh();
-            (message, true)
+    let message = match saved {
+        Ok(message) => message,
+        Err(error) => {
+            let what = match &pick {
+                Pick::AwsRegions(_) => "[aws] regions".to_owned(),
+                Pick::Components { platform, .. } => format!("{platform}'s [components]"),
+            };
+            return (format!("Could not save {what}: {error:#}"), false);
         }
-        Err(error) => (format!("Could not save [aws] regions: {error:#}"), false),
+    };
+    let (platform_name, keys) = match pick {
+        Pick::AwsRegions(codes) => (None, codes),
+        Pick::Components { platform, names } => (Some(platform), names),
+    };
+    let keys = (!keys.is_empty()).then_some(keys);
+    for platform in platforms {
+        let changed = match (&mut platform.source, &platform_name) {
+            (Source::Aws { regions, .. }, None) => {
+                regions.clone_from(&keys);
+                true
+            }
+            (Source::Statuspage { components, .. }, Some(name)) if platform.name == *name => {
+                components.clone_from(&keys);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            app.set_filter(&platform.name, filter_for(platform));
+        }
     }
+    app.start_refresh();
+    (message, true)
 }
 
 /// What the footer says when opening a link failed; `None` when it opened.
@@ -238,6 +292,7 @@ fn new_app(platforms: &[Platform]) -> App {
 fn filter_for(platform: &Platform) -> Filter {
     match &platform.source {
         Source::Aws { regions, .. } => Filter::AwsRegions(regions.clone()),
+        Source::Statuspage { components, .. } => Filter::Components(components.clone()),
         _ => Filter::None,
     }
 }
@@ -310,7 +365,7 @@ where
     OFut: Future<Output = Result<()>> + Send + 'static,
     H: Fn() -> HFut,
     HFut: Future<Output = History> + Send + 'static,
-    S: Fn(Vec<String>) -> SFut,
+    S: Fn(Pick) -> SFut,
     SFut: Future<Output = Result<String>> + Send + 'static,
 {
     let mut app = new_app(&platforms);
@@ -320,7 +375,7 @@ where
     let mut pending: Option<tokio::task::JoinHandle<Vec<PlatformStatus>>> = None;
     let mut reading: Option<tokio::task::JoinHandle<History>> = None;
     let mut opening: JoinSet<(String, Result<()>)> = JoinSet::new();
-    let mut saving: Option<tokio::task::JoinHandle<(Vec<String>, Result<String>)>> = None;
+    let mut saving: Option<tokio::task::JoinHandle<(Pick, Result<String>)>> = None;
     let mut notice_until: Option<Instant> = None;
 
     loop {
@@ -355,9 +410,10 @@ where
                 if saving.is_some() =>
             {
                 saving = None;
-                let (codes, saved) = joined
-                    .unwrap_or_else(|error| (Vec::new(), Err(anyhow!("the save stopped: {error}"))));
-                let (message, refetch) = apply_saved_regions(&mut app, &mut platforms, codes, saved);
+                let (message, refetch) = match joined {
+                    Ok((pick, saved)) => apply_saved(&mut app, &mut platforms, pick, saved),
+                    Err(error) => (format!("Could not save: the save stopped: {error}"), false),
+                };
                 notify(&mut app, &mut notice_until, message);
                 refetch
             }
@@ -379,14 +435,14 @@ where
                             notify(&mut app, &mut notice_until, message);
                             false
                         }
-                        Some(Effect::SaveAwsRegions(_)) if saving.is_some() => {
+                        Some(Effect::Save(_)) if saving.is_some() => {
                             let message = "The last save is still running; try again in a moment".to_owned();
                             notify(&mut app, &mut notice_until, message);
                             false
                         }
-                        Some(Effect::SaveAwsRegions(codes)) => {
-                            let saved = save(codes.clone());
-                            saving = Some(tokio::spawn(async move { (codes, saved.await) }));
+                        Some(Effect::Save(pick)) => {
+                            let saved = save(pick.clone());
+                            saving = Some(tokio::spawn(async move { (pick, saved.await) }));
                             false
                         }
                         None => false,
@@ -432,8 +488,8 @@ mod tests {
     }
 
     /// A config writer for tests that never save a filter.
-    async fn never_save(codes: Vec<String>) -> Result<String> {
-        panic!("nothing should save {codes:?}");
+    async fn never_save(pick: Pick) -> Result<String> {
+        panic!("nothing should save {pick:?}");
     }
 
     /// An opener for tests that never press `o`.
@@ -890,8 +946,8 @@ mod tests {
         let saves = Arc::new(std::sync::Mutex::new(Vec::new()));
         let save = {
             let saves = Arc::clone(&saves);
-            move |codes: Vec<String>| {
-                saves.lock().unwrap().push(codes);
+            move |pick: Pick| {
+                saves.lock().unwrap().push(pick.keys().to_vec());
                 async { Ok("Saved 2 AWS regions to /tmp/config.toml".to_owned()) }
             }
         };
@@ -948,7 +1004,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let save = {
             let release = Arc::clone(&release);
-            move |_: Vec<String>| {
+            move |_: Pick| {
                 let release = Arc::clone(&release);
                 async move {
                     release.notified().await;
@@ -996,7 +1052,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_save_keeps_the_old_regions_and_says_why() {
         let (fetched_tx, mut fetched) = unbounded_channel();
-        let save = |_: Vec<String>| async {
+        let save = |_: Pick| async {
             Err(anyhow!(
                 "could not write /tmp/config.toml: Permission denied"
             ))
@@ -1053,7 +1109,7 @@ mod tests {
         let (result, ()) = tokio::join!(
             event_loop(
                 &mut terminal,
-                github_and_calm(),
+                vec![Platform::check("API", "https://api.example", None)],
                 &mut events,
                 fetch_with_incidents,
                 never_open,
@@ -1065,8 +1121,125 @@ mod tests {
         result.unwrap();
         let screen = screen(&terminal);
         assert!(
-            screen.contains(" GitHub can't be filtered (only AWS regions can be picked)"),
+            screen.contains(
+                " API can't be filtered (only AWS regions and Statuspage components can be picked)"
+            ),
             "{screen}"
+        );
+    }
+
+    /// A fetcher that reports GitHub's watched components each fetch, and
+    /// parses the GitHub fixture with them.
+    fn fetch_reporting_components(
+        tx: UnboundedSender<Option<Vec<String>>>,
+    ) -> impl Fn(Vec<Platform>) -> std::future::Ready<Vec<PlatformStatus>> {
+        move |platforms: Vec<Platform>| {
+            let statuses = platforms
+                .iter()
+                .map(|platform| {
+                    let Source::Statuspage { components, .. } = &platform.source else {
+                        panic!("only Statuspage platforms here");
+                    };
+                    tx.send(components.clone()).unwrap();
+                    crate::providers::statuspage::parse_watching(
+                        &platform.name,
+                        include_bytes!("../../tests/fixtures/github_summary.json"),
+                        Utc::now(),
+                        components.as_deref(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            std::future::ready(statuses)
+        }
+    }
+
+    /// `f` on GitHub, tick Git Operations, Enter: the save gets the platform
+    /// and its names, and the refetch watches them, so the row's description
+    /// becomes the watched-components one.
+    #[tokio::test(start_paused = true)]
+    async fn saving_the_component_picker_refetches_with_the_new_components() {
+        let (fetched_tx, mut fetched) = unbounded_channel();
+        let saves = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let save = {
+            let saves = Arc::clone(&saves);
+            move |pick: Pick| {
+                saves.lock().unwrap().push(pick);
+                async { Ok("Saved 1 GitHub component to /tmp/config.toml".to_owned()) }
+            }
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        let (events_tx, mut events) = unbounded_channel();
+        let driver = async {
+            assert_eq!(fetched.recv().await.unwrap(), None);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            for code in [KeyCode::Char('f'), KeyCode::Char(' '), KeyCode::Enter] {
+                events_tx.send(Ok(key(code))).unwrap();
+            }
+            assert_eq!(
+                fetched.recv().await.unwrap(),
+                Some(vec!["Git Operations".to_owned()])
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            events_tx.send(Ok(key(KeyCode::Char('q')))).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            event_loop(
+                &mut terminal,
+                vec![Platform::statuspage(
+                    "GitHub",
+                    "https://www.githubstatus.com"
+                )],
+                &mut events,
+                fetch_reporting_components(fetched_tx),
+                never_open,
+                no_history,
+                save
+            ),
+            driver
+        );
+        result.unwrap();
+        assert_eq!(
+            *saves.lock().unwrap(),
+            [Pick::Components {
+                platform: "GitHub".into(),
+                names: vec!["Git Operations".into()],
+            }]
+        );
+        let screen = screen(&terminal);
+        assert!(
+            screen.contains("1 watched component operational"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(" Saved 1 GitHub component to /tmp/config.toml"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn saved_component_notices_name_the_platform_and_file() {
+        let path = Path::new("/home/me/config.toml");
+        let notice = |saved, count| saved_components_notice(path, saved, "GitHub", count);
+        assert_eq!(
+            notice(Saved::Created, 1),
+            "Created /home/me/config.toml watching 1 GitHub component"
+        );
+        assert_eq!(
+            notice(Saved::Updated, 2),
+            "Saved 2 GitHub components to /home/me/config.toml"
+        );
+        assert_eq!(
+            notice(Saved::Updated, 0),
+            "Removed GitHub from [components] in /home/me/config.toml: every component counts"
+        );
+        assert_eq!(
+            notice(Saved::Unchanged, 0),
+            "Every GitHub component already counts: /home/me/config.toml has no [components] entry for it"
+        );
+        assert_eq!(
+            notice(Saved::Unchanged, 3),
+            "/home/me/config.toml already watches these 3 GitHub components"
         );
     }
 
@@ -1074,23 +1247,23 @@ mod tests {
     fn saved_notices_name_the_file() {
         let path = Path::new("/home/me/.config/aretheydown/config.toml");
         assert_eq!(
-            saved_notice(path, Saved::Created, 1),
+            saved_regions_notice(path, Saved::Created, 1),
             "Created /home/me/.config/aretheydown/config.toml with 1 AWS region"
         );
         assert_eq!(
-            saved_notice(path, Saved::Updated, 3),
+            saved_regions_notice(path, Saved::Updated, 3),
             "Saved 3 AWS regions to /home/me/.config/aretheydown/config.toml"
         );
         assert_eq!(
-            saved_notice(path, Saved::Updated, 0),
+            saved_regions_notice(path, Saved::Updated, 0),
             "Removed [aws] regions from /home/me/.config/aretheydown/config.toml: every region counts"
         );
         assert_eq!(
-            saved_notice(path, Saved::Unchanged, 0),
+            saved_regions_notice(path, Saved::Unchanged, 0),
             "Every AWS region already counts: /home/me/.config/aretheydown/config.toml has no [aws] regions"
         );
         assert_eq!(
-            saved_notice(path, Saved::Unchanged, 2),
+            saved_regions_notice(path, Saved::Unchanged, 2),
             "/home/me/.config/aretheydown/config.toml already has these 2 AWS regions"
         );
     }

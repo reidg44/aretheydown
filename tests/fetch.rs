@@ -27,6 +27,7 @@ fn operational(name: &str) -> PlatformStatus {
         error: None,
         probe: None,
         regions: Vec::new(),
+        component_tree: Vec::new(),
     }
 }
 

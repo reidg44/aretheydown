@@ -1,6 +1,6 @@
 //! Statuspage parsing, tested against summaries captured from the live endpoints.
 
-use aretheydown::model::{IncidentKind, Level, PlatformStatus};
+use aretheydown::model::{ComponentNode, IncidentKind, Level, PlatformStatus};
 use aretheydown::providers::statuspage::{
     level_for_indicator, parse, parse_resolved, parse_watching, parse_with_resolved,
 };
@@ -645,4 +645,65 @@ fn a_watched_group_covers_resolved_incidents_on_its_components() {
     .unwrap();
     let titles: Vec<&str> = status.resolved.iter().map(|i| i.title.as_str()).collect();
     assert_eq!(titles, ["Workers errors"]);
+}
+
+fn tree_names(status: &PlatformStatus) -> Vec<String> {
+    status
+        .component_tree
+        .iter()
+        .map(|node| match node {
+            ComponentNode::Group { name, components } => {
+                format!("{name}: {}", components.join(" | "))
+            }
+            ComponentNode::Component(name) => name.clone(),
+        })
+        .collect()
+}
+
+#[test]
+fn the_component_tree_lists_an_ungrouped_page_in_feed_order() {
+    let status = parse("GitHub", GITHUB, fetched_at()).unwrap();
+    let names = tree_names(&status);
+    assert_eq!(names.len(), 12);
+    assert_eq!(
+        names[..3],
+        [
+            "Git Operations",
+            "Webhooks",
+            "Visit www.githubstatus.com for more information"
+        ]
+    );
+    assert_eq!(names[11], "Copilot AI Model Providers");
+}
+
+#[test]
+fn the_component_tree_puts_components_under_their_groups() {
+    // Incident-only components (Workers, Replicate, Queues) join their group;
+    // components of groups the trimmed feed lacks stay at the top level; the
+    // upcoming maintenance's Hong Kong is not listed.
+    for watch in [None, Some(&["Workers".to_owned()][..])] {
+        let status = parse_watching("Cloudflare", CLOUDFLARE, fetched_at(), watch).unwrap();
+        let names = tree_names(&status);
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Cloudflare Sites and Services: Workers | Replicate | Queues")
+        );
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some(
+                "North America: Albuquerque, United States - (ABQ) | Boston, United States - (BOS)"
+            )
+        );
+        assert_eq!(names[1], "Arica, Chile - (ARI)");
+        assert_eq!(names.len(), 2 + 16);
+        assert!(!names.iter().any(|n| n.contains("HKG")), "{names:?}");
+    }
+}
+
+#[test]
+fn the_component_tree_is_never_serialized() {
+    let status = parse("Cloudflare", CLOUDFLARE, fetched_at()).unwrap();
+    let json = serde_json::to_string(&status).unwrap();
+    assert!(!json.contains("component_tree"), "{json}");
+    assert!(!json.contains("Arica"), "{json}");
 }

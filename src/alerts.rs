@@ -240,6 +240,7 @@ mod tests {
             error: None,
             probe: None,
             regions: Vec::new(),
+            component_tree: Vec::new(),
         }
     }
 

@@ -88,8 +88,12 @@ fn footer_line(app: &App) -> Line<'static> {
     if let Some(picker) = app.picker() {
         let keys = if picker.typing() {
             " type to filter  ↑/↓ move  Backspace delete  Enter done  Esc clear filter"
-        } else {
+        } else if !picker.has_headings() {
             " ↑/↓ j/k move  Space tick  / filter  Enter save  Esc cancel  q quit"
+        } else if picker.on_collapsed_heading() {
+            " ↑/↓ j/k move  Space tick  →/← open/close group  / filter  Enter open group  Esc cancel  q quit"
+        } else {
+            " ↑/↓ j/k move  Space tick  →/← open/close group  / filter  Enter save  Esc cancel  q quit"
         };
         return Line::from(keys).dark_gray();
     }
@@ -277,9 +281,12 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: DateTime<Utc>) -
 
 /// Draw the filter picker over `area`: a filter line while one is typed or
 /// set, then one `[x] key  label` row per item it shows, the cursor's row
-/// highlighted, with the ticked count on the border.
+/// highlighted, with the ticked count on the border. A heading shows `▸`
+/// (collapsed) or `▾` before its key; the items under it are indented, and
+/// marked `[~]` while the ticked heading covers them.
 fn draw_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
-    let ticked = picker.items().iter().filter(|item| item.ticked).count();
+    // What Enter saves: covered items under a ticked heading don't count.
+    let ticked = picker.picked().len();
     let block = Block::bordered()
         .title(format!(" {} ", picker.title()))
         .title_top(
@@ -311,24 +318,63 @@ fn draw_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         frame.render_widget(Paragraph::new(Line::from(message).dark_gray()), list_area);
         return;
     }
+    let tree = picker.has_headings();
+    // A heading is drawn open (`▾`) while items under it show, which a
+    // filter can do for a collapsed one.
+    let open = |index: usize| {
+        visible
+            .iter()
+            .any(|&i| picker.items()[i].parent == Some(index))
+    };
+    // Before the mark (indent) and between the mark and the key (arrow).
+    let row_prefix = |index: usize| {
+        let item = &picker.items()[index];
+        match (item.heading, item.parent) {
+            (true, _) if open(index) => ("", "▾ "),
+            (true, _) => ("", "▸ "),
+            (false, Some(_)) => ("    ", ""),
+            (false, None) if tree => ("", "  "),
+            (false, None) => ("", ""),
+        }
+    };
     let key_width = visible
         .iter()
-        .map(|&index| picker.items()[index].key.chars().count())
+        .map(|&index| {
+            let (indent, arrow) = row_prefix(index);
+            let key = &picker.items()[index].key;
+            indent.chars().count() + arrow.chars().count() + key.chars().count()
+        })
         .max()
         .unwrap_or(0);
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&index| {
             let item = &picker.items()[index];
-            let mark = if item.ticked {
+            let (indent, arrow) = row_prefix(index);
+            let mark = if picker.covered(index) {
+                Span::from("[~] ").green()
+            } else if item.ticked {
                 Span::from("[x] ").green()
             } else {
                 Span::from("[ ] ")
             };
+            let width = key_width - indent.chars().count() - arrow.chars().count();
+            let hint = if picker.covered(index) {
+                "covered by its group"
+            } else {
+                &item.hint
+            };
+            let note = match (item.label.is_empty(), hint.is_empty()) {
+                (_, true) => item.label.clone(),
+                (true, false) => hint.to_owned(),
+                (false, false) => format!("{} {hint}", item.label),
+            };
             ListItem::new(Line::from(vec![
+                Span::from(indent),
                 mark,
-                Span::from(format!("{:key_width$}  ", item.key)),
-                Span::from(item.label.clone()).dark_gray(),
+                Span::from(arrow),
+                Span::from(format!("{:width$}  ", item.key)),
+                Span::from(note).dark_gray(),
             ]))
         })
         .collect();
@@ -851,6 +897,7 @@ mod tests {
             error: None,
             probe: None,
             regions: Vec::new(),
+            component_tree: Vec::new(),
         }
     }
 
@@ -2244,5 +2291,64 @@ mod tests {
         type_keys(&mut app, "zz");
         let text = screen(&render_sized(&mut app, 100, 12));
         assert!(text.contains("No regions match \"IREzz\"."), "{text}");
+    }
+
+    #[test]
+    fn the_component_picker_draws_groups_as_headings() {
+        use crate::tui::app::Filter;
+        let body = include_bytes!("../../tests/fixtures/cloudflare_summary.json");
+        let watch = vec!["North America".to_owned(), "Old One".to_owned()];
+        let status = crate::providers::statuspage::parse_watching(
+            "Cloudflare",
+            body,
+            chrono::Utc::now(),
+            Some(&watch),
+        )
+        .unwrap();
+        let mut app = App::new(vec!["Cloudflare".into()]);
+        app.set_filter("Cloudflare", Filter::Components(Some(watch)));
+        app.finish_refresh(vec![status], chrono::Utc::now());
+        type_keys(&mut app, "f");
+        let text = screen(&render_sized(&mut app, 140, 30));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("┌ Cloudflare components "), "{text}");
+        assert!(lines[1].contains(" 2 of 24 ticked "), "{text}");
+        assert!(
+            lines[2].starts_with("│> [x]   Old One                           not in feed"),
+            "{text}"
+        );
+        assert!(
+            lines[3].starts_with("│  [ ] ▸ Cloudflare Sites and Services     3 components"),
+            "{text}"
+        );
+        assert!(
+            lines[4].starts_with("│  [ ]   Arica, Chile - (ARI)"),
+            "{text}"
+        );
+        assert!(lines[20].starts_with("│  [x] ▸ North America"), "{text}");
+        assert!(
+            lines[29].starts_with(
+                " ↑/↓ j/k move  Space tick  →/← open/close group  / filter  Enter save"
+            ),
+            "{text}"
+        );
+
+        // Open North America: its components are indented and covered.
+        for _ in 0..20 {
+            type_keys(&mut app, "j");
+        }
+        let text = screen(&render_sized(&mut app, 140, 30));
+        assert!(text.contains("Enter open group"), "{text}");
+        let right = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Right,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        app.key(right);
+        let text = screen(&render_sized(&mut app, 140, 30));
+        assert!(text.contains("│> [x] ▾ North America"), "{text}");
+        assert!(
+            text.contains("│      [~] Boston, United States - (BOS)       covered by its group"),
+            "{text}"
+        );
     }
 }

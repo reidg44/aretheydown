@@ -167,5 +167,6 @@ pub fn parse(name: &str, body: &[u8], fetched_at: DateTime<Utc>) -> Result<Platf
         error: None,
         probe: None,
         regions: Vec::new(),
+        component_tree: Vec::new(),
     })
 }
