@@ -3,7 +3,7 @@
 
 use aretheydown::model::{IncidentKind, Level};
 use aretheydown::providers::aws::{
-    DASHBOARD_URL, decode, level_for_status, parse, parse_in_regions,
+    DASHBOARD_URL, REGIONS, decode, is_region_code, level_for_status, parse, parse_in_regions,
 };
 use aretheydown::providers::{self, Source};
 use chrono::{DateTime, TimeZone, Utc};
@@ -314,4 +314,35 @@ fn aws_is_a_builtin_platform() {
             regions: None,
         }
     );
+}
+
+#[test]
+fn regions_lists_every_active_events_region_counted_or_not() {
+    let body = r#"[
+        {"status": "3", "region_name": "UAE", "arn": "arn:aws:health:me-central-1::event/A"},
+        {"status": "2", "arn": "arn:aws:health:XX-NEW-1::event/B"},
+        {"status": "2", "arn": "arn:aws:health:me-central-1::event/C"},
+        {"status": "0", "arn": "arn:aws:health:eu-west-1::event/Fixed"},
+        {"status": "2", "region_name": "Global", "arn": "arn:aws:health:global::event/D"},
+        {"status": "3", "summary": "No ARN at all"}
+    ]"#;
+    let chosen = regions(&["us-east-1"]);
+    let filtered = parse_in_regions("AWS", &utf16be(body), fetched_at(), Some(&chosen)).unwrap();
+    assert_eq!(filtered.regions, ["me-central-1", "xx-new-1"]);
+    assert_eq!(filtered.incidents.len(), 2, "only the global events count");
+    let all = parse("AWS", &utf16be(body), fetched_at()).unwrap();
+    assert_eq!(all.regions, ["me-central-1", "xx-new-1"]);
+    let json = aretheydown::render::json(std::slice::from_ref(&all));
+    assert!(!json.contains("xx-new-1"), "never serialized: {json}");
+}
+
+#[test]
+fn the_built_in_region_list_holds_unique_valid_codes() {
+    let mut seen = std::collections::HashSet::new();
+    for (code, name) in REGIONS {
+        assert!(is_region_code(code), "{code}");
+        assert!(!name.is_empty(), "{code}");
+        assert!(seen.insert(code), "{code} is listed twice");
+    }
+    assert_eq!(REGIONS[0], ("us-east-1", "US East (N. Virginia)"));
 }

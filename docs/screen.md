@@ -29,11 +29,39 @@ The right pane shows the selected platform, in this order:
 | PageUp/PageDown or `K`/`J`   | Scroll a long incident list. The pane border shows `↑ more` or `↓ more` when there is more to see. |
 | Tab and Shift-Tab            | Move a highlight through the selected platform's incidents. It starts on the first and wraps at the ends. |
 | `o`                          | Open the highlighted incident in your default browser. If the incident has no link, or there are no incidents, it opens the platform's status page. If the browser can't be opened, the footer says why for a few seconds. |
+| `f`                          | Filter the selected platform: on AWS, opens the region picker (see below). On any other platform, the footer says it can't be filtered. |
 | `s`                          | Switch between worst-first order (the default: Outage, Unknown, Degraded, then Operational) and config order |
 | `t`                          | Open or close the timeline |
 | `r`                          | Refresh now |
 | `q` or Ctrl-C                | Quit |
 | Esc                          | Quit. In the timeline, Esc goes back to the list instead. |
+
+## AWS region picker
+
+Select AWS and press `f` to choose which regions count, instead of editing `[aws] regions` in the config by hand. The picker replaces the list and detail pane with a checklist:
+
+```text
+┌ AWS regions ───────────────────────────────────── 2 of 37 ticked ┐
+│> [x] us-east-1       US East (N. Virginia)                       │
+│  [ ] us-east-2       US East (Ohio)                              │
+│  [ ] us-west-1       US West (N. California)                     │
+│  [x] us-west-2       US West (Oregon)                            │
+```
+
+It lists every AWS region, plus any region code in your config or in the live AWS feed that the built-in list doesn't have. The regions in your `[aws] regions` start ticked.
+
+| Key                     | What it does |
+| ----------------------- | ------------ |
+| Up/Down or `j`/`k`      | Move |
+| Space                   | Tick or untick the region |
+| `/`                     | Type a filter: it matches the code or the name, in any case (`ire` finds `eu-west-1  Europe (Ireland)`). Enter stops typing and keeps the filter; Esc clears it. |
+| Enter                   | Save and close |
+| Esc                     | Clear the filter, or, with none, close without saving |
+| `q` or Ctrl-C           | Quit |
+
+Enter writes the ticked regions to `[aws] regions` in the config file the screen loaded (`--config <path>`, else the default path; see [Config file](config.md)). It reads the file again first, so edits made since the screen started are kept, and it changes only the `regions` line: comments and other sections stay as they were. With no config file, it creates one holding only `[aws] regions`. With nothing ticked, it removes `regions` (and an `[aws]` header left empty), so every region counts again. The footer says where the file was written, and the screen fetches again at once with the new regions.
+
+If the save fails (the file can't be written, or it no longer parses), the file stays as it was, the old regions stay in force, and the footer says why for a few seconds.
 
 ## History section
 

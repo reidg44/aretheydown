@@ -5,8 +5,10 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use super::picker::{Item, Outcome, Picker};
 use crate::history::Record;
 use crate::model::{Incident, Level, PlatformStatus, sort_worst_first};
+use crate::providers::aws;
 
 /// Something the user asked for with a key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,8 @@ pub enum Action {
     Refresh,
     /// Open or close the full-screen timeline of every platform.
     Timeline,
+    /// Open the selected platform's filter picker.
+    Filter,
     /// Close the timeline when it is open; otherwise quit.
     Back,
     Quit,
@@ -40,6 +44,21 @@ pub enum Effect {
     Refresh,
     /// Open this URL in the default browser.
     Open(String),
+    /// Show this message in the footer for a few seconds.
+    Notice(String),
+    /// Write these region codes to the config's `[aws] regions` (none
+    /// removes it), then refetch with them.
+    SaveAwsRegions(Vec<String>),
+}
+
+/// What `f` can filter on a platform.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Filter {
+    /// Nothing: `f` says so in the footer.
+    #[default]
+    None,
+    /// AWS, with the `[aws] regions` in force (`None`: every region).
+    AwsRegions(Option<Vec<String>>),
 }
 
 /// The order of the platform list.
@@ -93,6 +112,7 @@ impl Action {
             KeyCode::Char('s') => Some(Action::ToggleSort),
             KeyCode::Char('r') => Some(Action::Refresh),
             KeyCode::Char('t') => Some(Action::Timeline),
+            KeyCode::Char('f') => Some(Action::Filter),
             KeyCode::Esc => Some(Action::Back),
             KeyCode::Char('q') => Some(Action::Quit),
             _ => None,
@@ -169,6 +189,8 @@ struct Entry {
     status: Option<PlatformStatus>,
     /// Set while refreshes fail and `status` is older good data.
     stale: Option<Stale>,
+    /// What `f` filters.
+    filter: Filter,
 }
 
 impl Entry {
@@ -228,6 +250,8 @@ pub struct App {
     timeline: Option<u16>,
     /// The timeline as last drawn, for its page size and end.
     timeline_viewport: DetailViewport,
+    /// The filter picker, while it replaces the list and detail pane.
+    picker: Option<Picker>,
     quit: bool,
 }
 
@@ -252,6 +276,7 @@ impl App {
                 status_page,
                 status: None,
                 stale: None,
+                filter: Filter::None,
             })
             .collect();
         let order = (0..entries.len()).collect();
@@ -270,7 +295,31 @@ impl App {
             history: None,
             timeline: None,
             timeline_viewport: DetailViewport::default(),
+            picker: None,
             quit: false,
+        }
+    }
+
+    /// React to a key press: the picker takes every key while it is open;
+    /// otherwise the key's [`Action`] is applied.
+    pub fn key(&mut self, key: KeyEvent) -> Option<Effect> {
+        let Some(picker) = &mut self.picker else {
+            return Action::from_key(key).and_then(|action| self.apply(action));
+        };
+        match picker.key(key) {
+            Outcome::Stay => None,
+            Outcome::Cancel => {
+                self.picker = None;
+                None
+            }
+            Outcome::Save(codes) => {
+                self.picker = None;
+                Some(Effect::SaveAwsRegions(codes))
+            }
+            Outcome::Quit => {
+                self.quit = true;
+                None
+            }
         }
     }
 
@@ -309,6 +358,7 @@ impl App {
                 self.reorder();
             }
             Action::Timeline => self.timeline = Some(0),
+            Action::Filter => return self.open_picker(),
             Action::Back => self.quit = true,
             // Handled in `apply`, before the timeline and the list split.
             Action::Refresh | Action::Quit => {}
@@ -334,8 +384,43 @@ impl App {
             | Action::NextIncident
             | Action::PrevIncident
             | Action::Open
+            | Action::Filter
             | Action::Refresh
             | Action::Quit => {}
+        }
+    }
+
+    /// Open the selected platform's filter picker, or say in the footer that
+    /// it has none.
+    fn open_picker(&mut self) -> Option<Effect> {
+        let entry = self.selected_entry()?;
+        match &entry.filter {
+            Filter::None => Some(Effect::Notice(format!(
+                "{} can't be filtered (only AWS regions can be picked)",
+                entry.name
+            ))),
+            Filter::AwsRegions(regions) => {
+                let feed = entry
+                    .status
+                    .as_ref()
+                    .map_or(&[][..], |status| &status.regions);
+                let items = region_items(regions.as_deref(), feed);
+                self.picker = Some(Picker::new("AWS regions", "regions", items));
+                None
+            }
+        }
+    }
+
+    /// The filter picker, while it is open.
+    #[must_use]
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
+    /// Set what `f` filters on the platform named `name`.
+    pub fn set_filter(&mut self, name: &str, filter: Filter) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.name == name) {
+            entry.filter = filter;
         }
     }
 
@@ -468,6 +553,10 @@ impl App {
     /// open, else the detail pane), and keep the scroll it was drawn with (see
     /// [`App::scroll_for`] and [`App::timeline_scroll_for`]).
     pub fn set_viewport(&mut self, viewport: DetailViewport) {
+        if self.picker.is_some() {
+            // The picker covers the panes, so they keep their scroll.
+            return;
+        }
         if self.timeline.is_some() {
             self.timeline = Some(self.timeline_scroll_for(&viewport));
             self.timeline_viewport = viewport;
@@ -625,6 +714,38 @@ impl App {
     }
 }
 
+/// The AWS region picker's items: the built-in regions ([`aws::REGIONS`]),
+/// then any code in `configured` or `feed` that is not one of them. The codes
+/// in `configured` start ticked.
+#[must_use]
+pub fn region_items(configured: Option<&[String]>, feed: &[String]) -> Vec<Item> {
+    let configured = configured.unwrap_or_default();
+    let ticked = |code: &str| configured.iter().any(|c| c.eq_ignore_ascii_case(code));
+    let mut items: Vec<Item> = aws::REGIONS
+        .iter()
+        .map(|&(code, name)| Item {
+            key: code.to_owned(),
+            label: name.to_owned(),
+            ticked: ticked(code),
+        })
+        .collect();
+    let extras = configured
+        .iter()
+        .map(|code| (code, "(in your config)"))
+        .chain(feed.iter().map(|code| (code, "(in the live feed)")));
+    for (code, label) in extras {
+        let code = code.to_ascii_lowercase();
+        if !items.iter().any(|item| item.key == code) {
+            items.push(Item {
+                ticked: ticked(&code),
+                key: code,
+                label: label.to_owned(),
+            });
+        }
+    }
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -646,6 +767,7 @@ mod tests {
             fetched_at: Utc.with_ymd_and_hms(2026, 11, 13, 19, 10, 0).unwrap(),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 
@@ -1562,5 +1684,175 @@ mod tests {
         assert!(!app.should_quit());
         assert_eq!(app.apply(Action::Quit), None);
         assert!(app.should_quit());
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        press(code, KeyModifiers::NONE)
+    }
+
+    /// GitHub, Cloudflare, AWS (limited to us-west-2 and a code the built-in
+    /// list lacks), with AWS selected and an event in another new region.
+    fn aws_app() -> App {
+        let mut app = app();
+        app.set_filter(
+            "AWS",
+            Filter::AwsRegions(Some(vec!["us-west-2".into(), "xx-config-1".into()])),
+        );
+        let mut aws = status("AWS", Level::Degraded);
+        aws.regions = vec!["us-west-2".into(), "xx-feed-1".into()];
+        app.finish_refresh(
+            vec![
+                status("GitHub", Level::Operational),
+                status("Cloudflare", Level::Operational),
+                aws,
+            ],
+            Utc::now(),
+        );
+        assert_eq!(app.selected_row().unwrap().0, "AWS");
+        app
+    }
+
+    #[test]
+    fn f_maps_to_the_filter_action() {
+        assert_eq!(
+            Action::from_key(key(KeyCode::Char('f'))),
+            Some(Action::Filter)
+        );
+    }
+
+    #[test]
+    fn f_on_aws_opens_the_region_picker_with_the_configured_regions_ticked() {
+        let mut app = aws_app();
+        assert_eq!(app.key(key(KeyCode::Char('f'))), None);
+        let picker = app.picker().expect("the picker is open");
+        assert_eq!(picker.title(), "AWS regions");
+        let ticked: Vec<&str> = picker
+            .items()
+            .iter()
+            .filter(|item| item.ticked)
+            .map(|item| item.key.as_str())
+            .collect();
+        assert_eq!(ticked, ["us-west-2", "xx-config-1"]);
+        let keys: Vec<&str> = picker
+            .items()
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect();
+        assert_eq!(keys.len(), aws::REGIONS.len() + 2);
+        assert_eq!(&keys[keys.len() - 2..], ["xx-config-1", "xx-feed-1"]);
+    }
+
+    #[test]
+    fn f_on_a_platform_without_a_filter_shows_a_notice() {
+        let mut app = aws_app();
+        app.apply(Action::Down);
+        let name = app.selected_row().unwrap().0.to_owned();
+        let effect = app.key(key(KeyCode::Char('f')));
+        assert_eq!(
+            effect,
+            Some(Effect::Notice(format!(
+                "{name} can't be filtered (only AWS regions can be picked)"
+            )))
+        );
+        assert!(app.picker().is_none());
+    }
+
+    #[test]
+    fn picker_keys_tick_and_save_or_cancel() {
+        let mut app = aws_app();
+        app.key(key(KeyCode::Char('f')));
+        // us-east-1 is first: tick it. Untick us-west-2, the fourth.
+        app.key(key(KeyCode::Char(' ')));
+        for _ in 0..3 {
+            app.key(key(KeyCode::Char('j')));
+        }
+        app.key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::SaveAwsRegions(vec![
+                "us-east-1".into(),
+                "xx-config-1".into()
+            ]))
+        );
+        assert!(app.picker().is_none(), "saving closes the picker");
+
+        app.key(key(KeyCode::Char('f')));
+        app.key(key(KeyCode::Char(' ')));
+        assert_eq!(app.key(key(KeyCode::Esc)), None);
+        assert!(app.picker().is_none(), "Esc closes it");
+        assert!(!app.should_quit(), "Esc in the picker does not quit");
+    }
+
+    #[test]
+    fn list_keys_do_nothing_while_the_picker_is_open() {
+        let mut app = aws_app();
+        app.key(key(KeyCode::Char('f')));
+        for code in [
+            KeyCode::Char('r'),
+            KeyCode::Char('o'),
+            KeyCode::Tab,
+            KeyCode::Char('s'),
+        ] {
+            assert_eq!(app.key(key(code)), None, "{code:?}");
+        }
+        assert_eq!(app.sort_order(), SortOrder::WorstFirst);
+        assert!(app.picker().is_some());
+        app.key(key(KeyCode::Char('q')));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn f_does_nothing_in_the_timeline() {
+        let mut app = aws_app();
+        app.apply(Action::Timeline);
+        assert_eq!(app.key(key(KeyCode::Char('f'))), None);
+        assert!(app.picker().is_none());
+        assert!(app.timeline_open());
+    }
+
+    #[test]
+    fn the_picker_leaves_the_detail_scroll_alone() {
+        let mut app = aws_app();
+        app.set_viewport(DetailViewport {
+            content_lines: 30,
+            height: 10,
+            incident_lines: Vec::new(),
+        });
+        app.apply(Action::PageDown);
+        app.key(key(KeyCode::Char('f')));
+        app.set_viewport(DetailViewport::default());
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.detail_scroll(), 9);
+    }
+
+    #[test]
+    fn region_items_add_unknown_codes_once_after_the_built_ins() {
+        let configured = vec!["US-WEST-2".to_owned(), "xx-new-1".to_owned()];
+        let feed = vec![
+            "xx-new-1".to_owned(),
+            "us-east-1".to_owned(),
+            "yy-new-2".to_owned(),
+        ];
+        let items = region_items(Some(&configured), &feed);
+        assert_eq!(items.len(), aws::REGIONS.len() + 2);
+        let extras: Vec<(&str, &str, bool)> = items[aws::REGIONS.len()..]
+            .iter()
+            .map(|item| (item.key.as_str(), item.label.as_str(), item.ticked))
+            .collect();
+        assert_eq!(
+            extras,
+            [
+                ("xx-new-1", "(in your config)", true),
+                ("yy-new-2", "(in the live feed)", false)
+            ]
+        );
+        assert!(
+            items
+                .iter()
+                .find(|item| item.key == "us-west-2")
+                .unwrap()
+                .ticked
+        );
+        assert!(region_items(None, &[]).iter().all(|item| !item.ticked));
     }
 }

@@ -347,6 +347,7 @@ fn summary_status(
                 fetched_at,
                 error: None,
                 probe: None,
+                regions: Vec::new(),
             }
         };
     let Some(watch) = watch else {

@@ -195,6 +195,11 @@ pub struct PlatformStatus {
     /// lines stay as they were.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<Probe>,
+    /// AWS only: the region code of every active event in the feed, counted
+    /// or not (`[aws] regions` hides the rest), for the TUI's region picker.
+    /// Never serialized, so `--json` and history lines don't carry it.
+    #[serde(skip)]
+    pub regions: Vec<String>,
 }
 
 /// The result of a platform's probe: a GET of the vendor's own front door
@@ -231,6 +236,7 @@ impl PlatformStatus {
             fetched_at,
             error: Some(error.into()),
             probe: None,
+            regions: Vec::new(),
         }
     }
 }
@@ -357,6 +363,7 @@ mod tests {
             fetched_at: at,
             error: Some("partial".to_owned()),
             probe: None,
+            regions: Vec::new(),
         };
         let json = serde_json::to_string(&status).unwrap();
         let back: PlatformStatus = serde_json::from_str(&json).unwrap();

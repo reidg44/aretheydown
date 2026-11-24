@@ -26,6 +26,7 @@ fn operational(name: &str) -> PlatformStatus {
         fetched_at: Utc::now(),
         error: None,
         probe: None,
+        regions: Vec::new(),
     }
 }
 
