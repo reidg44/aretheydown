@@ -492,6 +492,7 @@ mod tests {
             fetched_at: Utc::now(),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 

@@ -488,6 +488,7 @@ pub fn backfill(
                 fetched_at: time,
                 error: None,
                 probe: None,
+                regions: Vec::new(),
             },
             backfilled: true,
         });
@@ -605,6 +606,7 @@ mod tests {
             fetched_at: t(0, 0),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 

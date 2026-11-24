@@ -96,6 +96,69 @@ pub fn decode(body: &[u8]) -> Result<String> {
     String::from_utf16(&units).context("response is not valid UTF-16")
 }
 
+/// The AWS regions the TUI's filter picker lists, code and name, in the
+/// order shown: the commercial regions (US first), then `GovCloud` and the
+/// European Sovereign Cloud. From botocore's `endpoints.json` (2026-11-23),
+/// without the China and ISO partitions, which the public Health Dashboard
+/// does not cover. A code in the config or the live feed that is not here
+/// is listed too, so a new region still shows up.
+pub const REGIONS: &[(&str, &str)] = &[
+    ("us-east-1", "US East (N. Virginia)"),
+    ("us-east-2", "US East (Ohio)"),
+    ("us-west-1", "US West (N. California)"),
+    ("us-west-2", "US West (Oregon)"),
+    ("af-south-1", "Africa (Cape Town)"),
+    ("ap-east-1", "Asia Pacific (Hong Kong)"),
+    ("ap-east-2", "Asia Pacific (Taipei)"),
+    ("ap-northeast-1", "Asia Pacific (Tokyo)"),
+    ("ap-northeast-2", "Asia Pacific (Seoul)"),
+    ("ap-northeast-3", "Asia Pacific (Osaka)"),
+    ("ap-south-1", "Asia Pacific (Mumbai)"),
+    ("ap-south-2", "Asia Pacific (Hyderabad)"),
+    ("ap-southeast-1", "Asia Pacific (Singapore)"),
+    ("ap-southeast-2", "Asia Pacific (Sydney)"),
+    ("ap-southeast-3", "Asia Pacific (Jakarta)"),
+    ("ap-southeast-4", "Asia Pacific (Melbourne)"),
+    ("ap-southeast-5", "Asia Pacific (Malaysia)"),
+    ("ap-southeast-6", "Asia Pacific (New Zealand)"),
+    ("ap-southeast-7", "Asia Pacific (Thailand)"),
+    ("ca-central-1", "Canada (Central)"),
+    ("ca-west-1", "Canada West (Calgary)"),
+    ("eu-central-1", "Europe (Frankfurt)"),
+    ("eu-central-2", "Europe (Zurich)"),
+    ("eu-north-1", "Europe (Stockholm)"),
+    ("eu-south-1", "Europe (Milan)"),
+    ("eu-south-2", "Europe (Spain)"),
+    ("eu-west-1", "Europe (Ireland)"),
+    ("eu-west-2", "Europe (London)"),
+    ("eu-west-3", "Europe (Paris)"),
+    ("il-central-1", "Israel (Tel Aviv)"),
+    ("me-central-1", "Middle East (UAE)"),
+    ("me-south-1", "Middle East (Bahrain)"),
+    ("mx-central-1", "Mexico (Central)"),
+    ("sa-east-1", "South America (São Paulo)"),
+    ("us-gov-east-1", "AWS GovCloud (US-East)"),
+    ("us-gov-west-1", "AWS GovCloud (US-West)"),
+    ("eusc-de-east-1", "AWS European Sovereign Cloud (Germany)"),
+];
+
+/// An AWS region code: a prefix of two or more letters, one or more words, and
+/// a number, joined by hyphens (`us-east-1`, `us-gov-west-1`, `eusc-de-east-1`).
+#[must_use]
+pub fn is_region_code(code: &str) -> bool {
+    let parts: Vec<&str> = code.split('-').collect();
+    let [prefix, words @ .., number] = parts.as_slice() else {
+        return false;
+    };
+    let letters = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase());
+    prefix.len() >= 2
+        && letters(prefix)
+        && !words.is_empty()
+        && words.iter().all(|word| letters(word))
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// A JSON value that is an integer or a string holding one.
 fn as_integer(value: &Value) -> Option<i64> {
     match value {
@@ -210,6 +273,15 @@ pub fn parse_in_regions(
         .filter(|event| event.level() != Level::Operational)
         .partition(|event| regions.is_none_or(|regions| event.counts_for(regions)));
     let level = Level::worst(shown.iter().map(RawEvent::level));
+    let mut feed_regions: Vec<String> = Vec::new();
+    for event in shown.iter().chain(&elsewhere) {
+        if let Some(code) = region_code(&event.arn).map(str::to_ascii_lowercase)
+            && is_region_code(&code)
+            && !feed_regions.contains(&code)
+        {
+            feed_regions.push(code);
+        }
+    }
     let shown_text = match shown.len() {
         0 => "No current events".to_owned(),
         1 => "1 current event".to_owned(),
@@ -228,5 +300,6 @@ pub fn parse_in_regions(
         fetched_at,
         error: None,
         probe: None,
+        regions: feed_regions,
     })
 }

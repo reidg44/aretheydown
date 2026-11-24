@@ -64,6 +64,8 @@ The URL shows on screen and in `--json`, so don't put a secret in it.
 
 `[aws] regions` makes AWS count only events in those region codes. Then a long-running event in a region you don't use doesn't keep AWS at `outage`. Global events (not tied to a region) always count. The AWS line says how many events in other regions it left out. Without `regions`, every region counts.
 
+You can also pick the regions on the interactive screen: select AWS and press `f` (see [AWS region picker](screen.md#aws-region-picker)). The screen writes `[aws] regions` into this file and changes nothing else in it. A running `aretheydown --serve` reads the config only when it starts, so it uses the new regions after its next start (`brew services restart aretheydown`).
+
 ## Statuspage components: `[components]`
 
 `[components]` does the same for Statuspage platforms: GitHub, Cloudflare, OpenAI, Anthropic, and any `[[statuspage]]` vendor.

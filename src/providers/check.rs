@@ -72,6 +72,7 @@ pub fn status(
         fetched_at,
         error: None,
         probe: None,
+        regions: Vec::new(),
     }
 }
 

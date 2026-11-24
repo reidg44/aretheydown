@@ -2,17 +2,17 @@
 
 ## Resume here
 
-v0.3.0 is the first public release, renamed from `platform-status`. The backlog is empty. Next: run `generate-ideas` for new work. Check the app first:
+Next ticket: [#2](https://github.com/reidg44/aretheydown/issues/2), the `f` picker for Statuspage components. It reuses the AWS region picker from #1: `src/tui/picker.rs` for the screen and the span-splicing writer in `src/config.rs` (`with_aws_regions`) as the model for a `[components]` writer. Start with:
 
 ```bash
-just check && just run --once
+just check && gh issue view 2
 ```
 
 ## What works
 
 All eight built-in platforms (GitHub, Cloudflare, AWS, Azure, Google Cloud, OpenAI, Anthropic, Microsoft 365 consumer services) in four ways:
 
-- **TUI** (`just run`): a verdict line, worst platform first, incidents with age, stage, and latest update, and the incidents resolved in the last 24h. Each row has a probe mark (`✓`/`✗`) and the detail pane a `Probe:` line. A failed refresh keeps the last good data for 10 minutes (`stale 4m`). Tab/`o` open incidents, and URLs are OSC 8 links. The detail pane ends with `History (last 7 days)` from the history file, and `t` shows every platform's changes in one full-screen timeline.
+- **TUI** (`just run`): a verdict line, worst platform first, incidents with age, stage, and latest update, and the incidents resolved in the last 24h. Each row has a probe mark (`✓`/`✗`) and the detail pane a `Probe:` line. A failed refresh keeps the last good data for 10 minutes (`stale 4m`). Tab/`o` open incidents, and URLs are OSC 8 links. The detail pane ends with `History (last 7 days)` from the history file, and `t` shows every platform's changes in one full-screen timeline. `f` on AWS opens a region checklist that writes `[aws] regions` to the config file and refetches (docs/screen.md → AWS region picker).
 - **`--once` / `--json`**: the same picture as text or JSON, with a `probe:` line / `probe` object per platform.
 - **`--serve`**: polls every 60s and serves a web page at `http://127.0.0.1:7341/` plus `/api/status`; the page and `/api/status` show each probe. It records changes to a JSON Lines history file (30 days kept, no probes) and POSTs `[alerts]` webhooks on held level changes (`levels` filter, several URLs). At start it backfills the history before its first record from the Statuspage and Google Cloud incident feeds (`backfilled: true`). `brew services start aretheydown` runs it in the background.
 - **`--at <time>`**: what every platform looked like then, from that history. Platforms from vendor history are marked `(from vendor history)`.
@@ -23,12 +23,13 @@ Level mappings per feed: `AGENTS.md` → "Status sources".
 
 ## Open tickets
 
-None.
+- [#2](https://github.com/reidg44/aretheydown/issues/2): `f` picker for Statuspage components and groups (`ready-for-agent`, unblocked by #1).
 
 ## Known limits
 
 - Azure counts every feed item as Degraded, including ones titled "Mitigated …" that stay up after a fix. The feed has never shown one; revisit if one causes a false alarm.
 - History backfill covers only Statuspage vendors and Google Cloud, and only as far back as their `incidents.json` reaches (often a few weeks). It shows no stage or update for past incidents and doesn't fill gaps while `--serve` was stopped (docs/history.md).
 - Probe defaults were checked live on 2026-11-16. If a vendor changes what its front door answers, the probe shows `✗` with `unexpected HTTP …`; fix the default in `probe::DEFAULTS` or override it with `[probes]`.
+- The region picker ticks the regions in force since the TUI started or last saved, not a fresh read of the file. A hand edit of `regions` made while the TUI runs is overwritten by the next save (other edits are kept). `aws::REGIONS` is a snapshot of botocore's list from 2026-11-23; codes in the config or the live feed that it lacks are still listed.
 
-Suggested skills: `generate-ideas`, then `next-ticket`.
+Suggested skills: `next-ticket`, `tdd`.

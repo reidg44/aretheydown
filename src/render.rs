@@ -270,6 +270,7 @@ mod tests {
             fetched_at: Utc.with_ymd_and_hms(2026, 11, 13, 19, 10, 0).unwrap(),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 

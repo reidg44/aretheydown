@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use crate::model::Level;
 use crate::providers::probe::{Expect, Target};
-use crate::providers::{self, Platform};
+use crate::providers::{self, Platform, aws};
 
 /// The config file's contents. Every key is optional; unknown keys are rejected.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -543,7 +543,7 @@ fn validated_aws_regions(codes: &[String]) -> Result<Vec<String>> {
         .iter()
         .map(|code| {
             let code = code.trim().to_lowercase();
-            if is_region_code(&code) {
+            if aws::is_region_code(&code) {
                 Ok(code)
             } else {
                 Err(anyhow!(
@@ -552,22 +552,6 @@ fn validated_aws_regions(codes: &[String]) -> Result<Vec<String>> {
             }
         })
         .collect()
-}
-
-/// An AWS region code: a prefix of two or more letters, one or more words, and
-/// a number, joined by hyphens (`us-east-1`, `us-gov-west-1`, `eusc-de-east-1`).
-fn is_region_code(code: &str) -> bool {
-    let parts: Vec<&str> = code.split('-').collect();
-    let [prefix, words @ .., number] = parts.as_slice() else {
-        return false;
-    };
-    let letters = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase());
-    prefix.len() >= 2
-        && letters(prefix)
-        && !words.is_empty()
-        && words.iter().all(|word| letters(word))
-        && !number.is_empty()
-        && number.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Built-in platform names match `hide` entries regardless of case.
@@ -677,6 +661,267 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
             })
         })
         .with_context(|| format!("invalid config file {}", path.display()))
+}
+
+/// `text`, a config file's contents, with `[aws] regions` set to `regions`
+/// (written in that order). Every other byte stays as it was: comments, other
+/// sections, and the spacing around them; only a `regions` list written over
+/// several lines becomes one line, losing comments inside it. An empty `regions` removes the
+/// `regions` line(s), and the `[aws]` header line when nothing else is left
+/// under it, so every region counts again.
+///
+/// `[aws] regions` may be written as a table, a dotted `aws.regions` key, or
+/// an inline `aws = { … }`; with none, an `[aws]` table is added at the end.
+///
+/// # Errors
+///
+/// Fails when `text` is not a valid config, or the edited text would not be
+/// one. No message repeats a value from the file (it may hold a webhook URL).
+pub fn with_aws_regions(text: &str, regions: &[String]) -> Result<String> {
+    parse(text)?;
+    // `parse` accepted it, so this only fails on a difference between the two
+    // parsers; toml_edit's message quotes the line, so it is not passed on.
+    let document = toml_edit::Document::parse(text)
+        .map_err(|_| anyhow!("the file could not be read for editing"))?;
+    let edited = match find_aws_regions(&document) {
+        Some(found) => found.apply(text, regions),
+        None if regions.is_empty() => text.to_owned(),
+        None => {
+            let mut edited = text.to_owned();
+            if !edited.is_empty() && !edited.ends_with('\n') {
+                edited.push('\n');
+            }
+            if !edited.trim().is_empty() {
+                edited.push('\n');
+            }
+            edited.push_str("[aws]\n");
+            edited.push_str(&regions_line(regions));
+            edited.push('\n');
+            edited
+        }
+    };
+    check_edited(&edited, regions)?;
+    Ok(edited)
+}
+
+/// `regions = ["us-east-1", "us-west-2"]`, with no newline.
+fn regions_line(regions: &[String]) -> String {
+    let codes: Vec<String> = regions.iter().map(|code| format!("{code:?}")).collect();
+    format!("regions = [{}]", codes.join(", "))
+}
+
+/// Where `[aws] regions` sits in a parsed config file, as byte ranges.
+enum AwsRegionsAt {
+    /// An `[aws]` header with no `regions` under it (the range is the header).
+    EmptyTable(std::ops::Range<usize>),
+    /// `aws = { }` with no `regions` (the range is the `{ … }` value).
+    EmptyInline(std::ops::Range<usize>),
+    /// A `regions = […]` key and value, from the key to the end of the value.
+    /// `header` is the `[aws]` header it sits under, if it sits under one;
+    /// `line` is the whole `aws = { … }` line it is part of, if inline.
+    Key {
+        key_value: std::ops::Range<usize>,
+        header: Option<std::ops::Range<usize>>,
+        inline: Option<std::ops::Range<usize>>,
+    },
+}
+
+/// Find `[aws] regions` in `document`; `None` when there is no `aws` key.
+fn find_aws_regions(document: &toml_edit::Document<&str>) -> Option<AwsRegionsAt> {
+    let (aws_key, aws) = document.as_table().get_key_value("aws")?;
+    let span = |key: &toml_edit::Key, item: &toml_edit::Item| -> Option<std::ops::Range<usize>> {
+        Some(key.span()?.start..item.span()?.end)
+    };
+    match aws {
+        toml_edit::Item::Table(table) => {
+            let header = (!table.is_dotted()).then(|| table.span()).flatten();
+            match table.get_key_value("regions") {
+                Some((key, item)) => Some(AwsRegionsAt::Key {
+                    key_value: span(key, item)?,
+                    header,
+                    inline: None,
+                }),
+                None => header.map(AwsRegionsAt::EmptyTable),
+            }
+        }
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => {
+            match table.get_key_value("regions") {
+                Some((key, item)) => Some(AwsRegionsAt::Key {
+                    key_value: span(key, item)?,
+                    header: None,
+                    inline: span(aws_key, aws),
+                }),
+                None => table.span().map(AwsRegionsAt::EmptyInline),
+            }
+        }
+        _ => None,
+    }
+}
+
+impl AwsRegionsAt {
+    /// `text` with this place set to `regions`, or cleared when it is empty.
+    fn apply(self, text: &str, regions: &[String]) -> String {
+        let line = regions_line(regions);
+        let splice = |range: std::ops::Range<usize>, with: &str| {
+            format!("{}{with}{}", &text[..range.start], &text[range.end..])
+        };
+        match self {
+            Self::EmptyTable(_) | Self::EmptyInline(_) if regions.is_empty() => text.to_owned(),
+            Self::EmptyTable(header) => {
+                let after = line_end(text, header.end);
+                let newline = if text[..after].ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                splice(after..after, &format!("{newline}{line}\n"))
+            }
+            Self::EmptyInline(value) => splice(value, &format!("{{ {line} }}")),
+            Self::Key { key_value, .. } if !regions.is_empty() => splice(key_value, &line),
+            // `aws = { regions = […] }` holds nothing else: drop the line.
+            Self::Key {
+                inline: Some(whole),
+                ..
+            } => splice(whole_lines(text, &whole), ""),
+            Self::Key {
+                key_value, header, ..
+            } => {
+                let removed = splice(whole_lines(text, &key_value), "");
+                // Only `regions` may sit under `[aws]`, so its header is left
+                // with nothing; it comes before the key, so its range holds.
+                match header {
+                    Some(header) => {
+                        let lines = whole_lines(&removed, &header);
+                        format!("{}{}", &removed[..lines.start], &removed[lines.end..])
+                    }
+                    None => removed,
+                }
+            }
+        }
+    }
+}
+
+/// The whole lines `range` touches, with the last one's newline.
+fn whole_lines(text: &str, range: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+    line_start(text, range.start)..line_end(text, range.end)
+}
+
+/// The start of the line holding byte `at`.
+fn line_start(text: &str, at: usize) -> usize {
+    text[..at].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+/// Just past the end of the line holding byte `at`: after its newline, or
+/// the end of `text`.
+fn line_end(text: &str, at: usize) -> usize {
+    text[at..]
+        .find('\n')
+        .map_or(text.len(), |newline| at + newline + 1)
+}
+
+/// Check that `edited` still loads and sets exactly `regions`.
+fn check_edited(edited: &str, regions: &[String]) -> Result<()> {
+    let config = parse(edited)?;
+    apply(providers::builtin(), &config)
+        .and_then(|_| alerts(&config))
+        .map_err(|error| anyhow!("{}", redact_values(&format!("{error:#}"))))?;
+    let expected = (!regions.is_empty()).then(|| regions.to_vec());
+    if config.aws.regions != expected {
+        bail!("the file could not be edited safely; change [aws] regions by hand");
+    }
+    Ok(())
+}
+
+/// What [`save_aws_regions`] did to the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Saved {
+    /// There was no file; it was created.
+    Created,
+    /// The file was rewritten.
+    Updated,
+    /// The file already said that (or, with no regions, there was nothing
+    /// to remove), so it was left alone; a missing file stays missing.
+    Unchanged,
+}
+
+/// Set `[aws] regions` in the config file at `path` ([`with_aws_regions`]),
+/// reading it fresh so edits made since it was loaded are kept. A missing
+/// file (and its directory) is created; a file that would not change is not
+/// written. The new text goes to `<file>.tmp`, created readable by its owner
+/// only (it may hold a webhook URL) and given the old file's mode, then is
+/// renamed over the file (the symlink's target, if `path` is one), so a
+/// failure leaves the file as it was.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read or written, or is not a valid config.
+/// The message names the file but never repeats a value from it.
+pub fn save_aws_regions(path: &Path, regions: &[String]) -> Result<Saved> {
+    let target = symlink_target(path);
+    let (text, saved) = match std::fs::read_to_string(&target) {
+        Ok(text) => (text, Saved::Updated),
+        Err(error) if error.kind() == ErrorKind::NotFound => (String::new(), Saved::Created),
+        Err(error) => bail!("could not read {}: {error}", path.display()),
+    };
+    let edited =
+        with_aws_regions(&text, regions).with_context(|| format!("in {}", path.display()))?;
+    if edited == text && (saved == Saved::Updated || edited.is_empty()) {
+        return Ok(Saved::Unchanged);
+    }
+    if let Some(dir) = target.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    let mut tmp = target.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = write_private(&tmp, &edited).and_then(|()| {
+        if let Ok(metadata) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, metadata.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    });
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("could not write {}: {error}", path.display());
+    }
+    Ok(saved)
+}
+
+/// The file `path` names: itself, or, through any symlinks, the file they
+/// point to, even one that does not exist yet.
+fn symlink_target(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut target = path.to_path_buf();
+    // A bounded walk, so a symlink loop cannot hang the save.
+    for _ in 0..40 {
+        match std::fs::read_link(&target) {
+            Ok(link) => {
+                target = match target.parent() {
+                    Some(dir) => dir.join(link),
+                    None => link,
+                };
+            }
+            Err(_) => break,
+        }
+    }
+    target
+}
+
+/// Write `text` to a new file at `path` that only its owner can read (on
+/// Unix), replacing any file left there.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -1617,5 +1862,257 @@ GitHub = false
             message.contains("/definitely/not/here/config.toml"),
             "{message}"
         );
+    }
+
+    fn codes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|&code| code.to_owned()).collect()
+    }
+
+    /// A config with comments everywhere and an `[aws]` table in the middle.
+    const COMMENTED: &str = "# My config.\nhide = [\"Azure\"] # not used\n\n# AWS: only my regions.\n[aws]\n# Keep these short.\nregions = [\"us-east-1\"] # home\n\n# GitHub, only what I use.\n[components]\nGitHub = [\"Actions\"]   # CI\n\n[alerts]\nwebhook = \"https://hooks.example.com/services/T0/B0/s3cret\"\n";
+
+    #[test]
+    fn saving_regions_changes_only_the_regions_line() {
+        let edited = with_aws_regions(COMMENTED, &codes(&["us-west-2", "eu-west-1"])).unwrap();
+        let expected = COMMENTED.replace(
+            "regions = [\"us-east-1\"] # home",
+            "regions = [\"us-west-2\", \"eu-west-1\"] # home",
+        );
+        assert_eq!(edited, expected);
+        assert_eq!(
+            parse(&edited).unwrap().aws.regions,
+            Some(codes(&["us-west-2", "eu-west-1"]))
+        );
+    }
+
+    #[test]
+    fn a_multi_line_region_list_becomes_one_line() {
+        let text = "[aws]\nregions = [\n  \"us-east-1\",\n  \"us-west-2\", # west\n]\n\n[components]\nGitHub = [\"Actions\"]\n";
+        let edited = with_aws_regions(text, &codes(&["eu-west-1"])).unwrap();
+        assert_eq!(
+            edited,
+            "[aws]\nregions = [\"eu-west-1\"]\n\n[components]\nGitHub = [\"Actions\"]\n"
+        );
+    }
+
+    #[test]
+    fn without_an_aws_table_one_is_added_at_the_end() {
+        let text = "# Mine.\nhide = [\"Azure\"]\n\n[components]\nGitHub = [\"Actions\"] # CI";
+        let edited = with_aws_regions(text, &codes(&["us-east-1"])).unwrap();
+        assert_eq!(
+            edited,
+            format!("{text}\n\n[aws]\nregions = [\"us-east-1\"]\n")
+        );
+        assert_eq!(
+            with_aws_regions("", &codes(&["us-east-1", "us-west-2"])).unwrap(),
+            "[aws]\nregions = [\"us-east-1\", \"us-west-2\"]\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_aws_table_gets_the_regions_under_its_header() {
+        let text = "[aws] # mine\n[components]\nGitHub = [\"Actions\"]\n";
+        assert_eq!(
+            with_aws_regions(text, &codes(&["us-east-1"])).unwrap(),
+            "[aws] # mine\nregions = [\"us-east-1\"]\n[components]\nGitHub = [\"Actions\"]\n"
+        );
+        assert_eq!(
+            with_aws_regions("[aws]", &codes(&["us-east-1"])).unwrap(),
+            "[aws]\nregions = [\"us-east-1\"]\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_pick_removes_regions_and_the_empty_aws_header() {
+        let edited = with_aws_regions(COMMENTED, &[]).unwrap();
+        let expected = COMMENTED.replace(
+            "[aws]\n# Keep these short.\nregions = [\"us-east-1\"] # home\n",
+            "# Keep these short.\n",
+        );
+        assert_eq!(edited, expected);
+        let config = parse(&edited).unwrap();
+        assert_eq!(config.aws.regions, None);
+        assert!(apply(providers::builtin(), &config).is_ok());
+        // Nothing to remove: the text is returned as it was.
+        let none = "hide = [\"Azure\"]\n";
+        assert_eq!(with_aws_regions(none, &[]).unwrap(), none);
+        assert_eq!(
+            with_aws_regions("[aws]\n# c\n", &[]).unwrap(),
+            "[aws]\n# c\n"
+        );
+    }
+
+    #[test]
+    fn dotted_and_inline_aws_keys_are_edited_in_place() {
+        let dotted = "hide = []\naws.regions = [\"us-east-1\"] # d\n[components]\n";
+        assert_eq!(
+            with_aws_regions(dotted, &codes(&["eu-west-1"])).unwrap(),
+            "hide = []\naws.regions = [\"eu-west-1\"] # d\n[components]\n"
+        );
+        assert_eq!(
+            with_aws_regions(dotted, &[]).unwrap(),
+            "hide = []\n[components]\n"
+        );
+        let inline = "aws = { regions = [\"us-east-1\"] } # i\nhide = []\n";
+        assert_eq!(
+            with_aws_regions(inline, &codes(&["eu-west-1"])).unwrap(),
+            "aws = { regions = [\"eu-west-1\"] } # i\nhide = []\n"
+        );
+        assert_eq!(with_aws_regions(inline, &[]).unwrap(), "hide = []\n");
+        assert_eq!(
+            with_aws_regions("aws = {}\n", &codes(&["eu-west-1"])).unwrap(),
+            "aws = { regions = [\"eu-west-1\"] }\n"
+        );
+    }
+
+    #[test]
+    fn an_invalid_file_is_not_edited_and_the_error_hides_its_values() {
+        for text in [
+            "[alerts]\nwebhook = \"https://hooks.example.com/s3cret\"\nhide = \"https://hooks.example.com/s3cret\"\n",
+            "[alerts]\nwebhook = \"https://hooks.example.com/s3cret\"\nlevels = []\n",
+            "[[check]]\nname = \"API\"\nurl = \"ftp://hooks.example.com/s3cret\"\n",
+            "[alerts]\nwebhook = \"https://hooks.example.com/s3cret\"\n[aws\n",
+        ] {
+            let message = format!(
+                "{:#}",
+                with_aws_regions(text, &codes(&["us-east-1"])).unwrap_err()
+            );
+            assert!(!message.contains("s3cret"), "{text}: {message}");
+            assert!(!message.contains("hooks.example"), "{text}: {message}");
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aretheydown-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn saving_creates_a_missing_file_that_loads_back_to_the_picks() {
+        let dir = temp_dir("save-new");
+        let path = dir.join("sub").join("config.toml");
+        let picks = codes(&["us-east-1", "eu-west-1"]);
+        assert_eq!(save_aws_regions(&path, &picks).unwrap(), Saved::Created);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "[aws]\nregions = [\"us-east-1\", \"eu-west-1\"]\n");
+        let loaded = load(Some(&path)).unwrap();
+        let aws = loaded.platforms.iter().find(|p| p.name == "AWS").unwrap();
+        assert!(
+            matches!(&aws.source, Source::Aws { regions, .. } if regions.as_ref() == Some(&picks))
+        );
+        assert_eq!(save_aws_regions(&path, &picks).unwrap(), Saved::Unchanged);
+        assert_eq!(save_aws_regions(&path, &[]).unwrap(), Saved::Updated);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(load(Some(&path)).is_ok());
+        assert!(!path.with_extension("toml.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_pick_without_a_file_creates_none() {
+        let dir = temp_dir("save-none");
+        let path = dir.join("config.toml");
+        assert_eq!(save_aws_regions(&path, &[]).unwrap(), Saved::Unchanged);
+        assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn saving_reads_the_file_fresh() {
+        let dir = temp_dir("save-fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        save_aws_regions(&path, &codes(&["us-west-2"])).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            COMMENTED.replace("[\"us-east-1\"] # home", "[\"us-west-2\"] # home")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_file_as_it_was() {
+        let dir = temp_dir("save-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let broken = "[alerts]\nwebhook = \"https://hooks.example.com/s3cret\"\n[aws\n";
+        std::fs::write(&path, broken).unwrap();
+        let message = format!(
+            "{:#}",
+            save_aws_regions(&path, &codes(&["us-east-1"])).unwrap_err()
+        );
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_into_a_read_only_directory_fails_and_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("save-readonly");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = save_aws_regions(&path, &codes(&["us-west-2"]));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.starts_with("could not write "), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), COMMENTED);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_symlink_keeps_the_link_and_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("save-link");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.toml");
+        std::fs::write(&real, "hide = []\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        save_aws_regions(&link, &codes(&["us-east-1"])).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "hide = []\n\n[aws]\nregions = [\"us-east-1\"]\n"
+        );
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A link to a file that is not there yet: the file is created there.
+        let dangling = dir.join("dangling.toml");
+        std::os::unix::fs::symlink("new.toml", &dangling).unwrap();
+        assert_eq!(
+            save_aws_regions(&dangling, &codes(&["us-east-1"])).unwrap(),
+            Saved::Created
+        );
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let created = dir.join("new.toml");
+        assert_eq!(
+            std::fs::read_to_string(&created).unwrap(),
+            "[aws]\nregions = [\"us-east-1\"]\n"
+        );
+        let mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a new file is readable by its owner only");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

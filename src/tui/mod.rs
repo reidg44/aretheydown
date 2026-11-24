@@ -7,6 +7,7 @@
 
 pub mod app;
 mod link;
+pub mod picker;
 pub mod view;
 mod wrap;
 
@@ -25,10 +26,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 
+use crate::config::{self, Saved};
 use crate::model::PlatformStatus;
-use crate::providers::Platform;
+use crate::providers::{Platform, Source};
 use crate::{fetch, history};
-use app::{Action, App, DetailViewport, Effect, History};
+use app::{App, DetailViewport, Effect, Filter, History};
 
 /// How often the statuses refresh on their own.
 pub use crate::fetch::REFRESH_INTERVAL;
@@ -41,7 +43,8 @@ const INPUT_POLL: Duration = Duration::from_millis(200);
 
 /// Run the TUI over `platforms` until the user quits. `history` is the
 /// history file `--serve` writes (or why there is none), read on each refresh
-/// for the detail pane's history section.
+/// for the detail pane's history section. `config` is the config file the
+/// filter picker saves to (`None` when no location is known).
 ///
 /// Takes over the terminal (raw mode, alternate screen) and restores it on
 /// return, on error, and on panic.
@@ -53,6 +56,7 @@ pub async fn run(
     client: reqwest::Client,
     platforms: Vec<Platform>,
     history: Result<PathBuf, String>,
+    config: Option<PathBuf>,
 ) -> Result<()> {
     // `try_init` also installs a panic hook that restores the terminal.
     let mut terminal = match ratatui::try_init() {
@@ -99,6 +103,21 @@ pub async fn run(
                 .unwrap_or_else(|error| read_failed(&error))
         }
     };
+    // A small file, but the disk may be slow: write it off the async threads.
+    let save = move |codes: Vec<String>| {
+        let path = config.clone();
+        async move {
+            let path = path.ok_or_else(|| {
+                anyhow!("there is no config file location (set HOME or XDG_CONFIG_HOME, or pass --config)")
+            })?;
+            tokio::task::spawn_blocking(move || {
+                let saved = config::save_aws_regions(&path, &codes)?;
+                Ok(saved_notice(&path, saved, codes.len()))
+            })
+            .await
+            .context("the save stopped")?
+        }
+    };
     let result = event_loop(
         &mut terminal,
         platforms,
@@ -106,6 +125,7 @@ pub async fn run(
         fetch,
         open,
         load_history,
+        save,
     )
     .await;
 
@@ -115,6 +135,111 @@ pub async fn run(
     let _ = input.join();
     ratatui::restore();
     result
+}
+
+/// The footer notice after [`config::save_aws_regions`] wrote `count`
+/// region codes to `path`.
+fn saved_notice(path: &Path, saved: Saved, count: usize) -> String {
+    let path = path.display();
+    let regions = if count == 1 {
+        "1 AWS region".to_owned()
+    } else {
+        format!("{count} AWS regions")
+    };
+    match (saved, count) {
+        (Saved::Unchanged, 0) => {
+            format!("Every AWS region already counts: {path} has no [aws] regions")
+        }
+        (Saved::Unchanged, _) => format!("{path} already has these {regions}"),
+        (_, 0) => format!("Removed [aws] regions from {path}: every region counts"),
+        (Saved::Created, _) => format!("Created {path} with {regions}"),
+        (Saved::Updated, _) => format!("Saved {regions} to {path}"),
+    }
+}
+
+/// Act on the outcome of saving the region picker's `codes`, returning the
+/// footer notice and whether to refetch. On success, every AWS platform takes
+/// the new regions (none: every region), and the refetch starts at once, even
+/// if a refresh is running. On failure, the old regions stay and the notice
+/// says why.
+fn apply_saved_regions(
+    app: &mut App,
+    platforms: &mut [Platform],
+    codes: Vec<String>,
+    saved: Result<String>,
+) -> (String, bool) {
+    match saved {
+        Ok(message) => {
+            let regions = (!codes.is_empty()).then_some(codes);
+            for platform in platforms {
+                if let Source::Aws {
+                    regions: current, ..
+                } = &mut platform.source
+                {
+                    current.clone_from(&regions);
+                    app.set_filter(&platform.name, filter_for(platform));
+                }
+            }
+            app.start_refresh();
+            (message, true)
+        }
+        Err(error) => (format!("Could not save [aws] regions: {error:#}"), false),
+    }
+}
+
+/// What the footer says when opening a link failed; `None` when it opened.
+fn open_failure(opened: Result<(String, Result<()>), tokio::task::JoinError>) -> Option<String> {
+    match opened {
+        Ok((_, Ok(()))) => None,
+        Ok((url, Err(error))) => Some(format!("Could not open {url}: {error:#}")),
+        Err(error) => Some(format!("Could not open the link: {error}")),
+    }
+}
+
+/// On quit: drop a running fetch and history read, but let a save finish,
+/// so quitting right after Enter still writes it.
+async fn stop<T, H, S>(
+    pending: Option<tokio::task::JoinHandle<T>>,
+    reading: Option<tokio::task::JoinHandle<H>>,
+    saving: Option<tokio::task::JoinHandle<S>>,
+) {
+    if let Some(task) = pending {
+        task.abort();
+    }
+    if let Some(task) = reading {
+        task.abort();
+    }
+    if let Some(task) = saving {
+        let _ = task.await;
+    }
+}
+
+/// Show `message` in the footer for [`NOTICE_DURATION`] from now.
+fn notify(app: &mut App, until: &mut Option<Instant>, message: String) {
+    app.set_notice(message);
+    *until = Some(Instant::now() + NOTICE_DURATION);
+}
+
+/// A fresh app for `platforms`, each with its status page and filter.
+fn new_app(platforms: &[Platform]) -> App {
+    let mut app = App::with_status_pages(
+        platforms
+            .iter()
+            .map(|p| (p.name.clone(), p.source.status_page()))
+            .collect(),
+    );
+    for platform in platforms {
+        app.set_filter(&platform.name, filter_for(platform));
+    }
+    app
+}
+
+/// What `f` filters on `platform`.
+fn filter_for(platform: &Platform) -> Filter {
+    match &platform.source {
+        Source::Aws { regions, .. } => Filter::AwsRegions(regions.clone()),
+        _ => Filter::None,
+    }
 }
 
 /// What the history file at `path` holds, for [`App::set_history`].
@@ -162,14 +287,19 @@ fn spawn_input_thread(tx: UnboundedSender<io::Result<Event>>) -> thread::JoinHan
 /// platform never blocks input or drawing. `open` gets a URL to show in the
 /// browser and also runs in its own task; when it fails, the footer says so
 /// for [`NOTICE_DURATION`]. `load_history` reads the history file; it runs
-/// in its own task alongside each refresh's fetch.
-async fn event_loop<B, F, Fut, O, OFut, H, HFut>(
+/// in its own task alongside each refresh's fetch. `save` writes the AWS
+/// region picker's codes to the config file and returns the footer notice;
+/// it runs in its own task, one at a time. After it succeeds, the platforms
+/// take the new regions and a refresh starts at once (replacing one in
+/// flight). A failure keeps the old regions and shows why in the footer.
+async fn event_loop<B, F, Fut, O, OFut, H, HFut, S, SFut>(
     terminal: &mut Terminal<B>,
-    platforms: Vec<Platform>,
+    mut platforms: Vec<Platform>,
     events: &mut UnboundedReceiver<io::Result<Event>>,
     fetch: F,
     open: O,
     load_history: H,
+    save: S,
 ) -> Result<()>
 where
     B: Backend,
@@ -180,19 +310,17 @@ where
     OFut: Future<Output = Result<()>> + Send + 'static,
     H: Fn() -> HFut,
     HFut: Future<Output = History> + Send + 'static,
+    S: Fn(Vec<String>) -> SFut,
+    SFut: Future<Output = Result<String>> + Send + 'static,
 {
-    let mut app = App::with_status_pages(
-        platforms
-            .iter()
-            .map(|p| (p.name.clone(), p.source.status_page()))
-            .collect(),
-    );
+    let mut app = new_app(&platforms);
     // The first tick fires at once, so data loads on startup.
     let mut ticker = interval_at(Instant::now(), REFRESH_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut pending: Option<tokio::task::JoinHandle<Vec<PlatformStatus>>> = None;
     let mut reading: Option<tokio::task::JoinHandle<History>> = None;
     let mut opening: JoinSet<(String, Result<()>)> = JoinSet::new();
+    let mut saving: Option<tokio::task::JoinHandle<(Vec<String>, Result<String>)>> = None;
     let mut notice_until: Option<Instant> = None;
 
     loop {
@@ -218,16 +346,20 @@ where
                 false
             }
             Some(opened) = opening.join_next(), if !opening.is_empty() => {
-                let failure = match opened {
-                    Ok((_, Ok(()))) => None,
-                    Ok((url, Err(error))) => Some(format!("Could not open {url}: {error:#}")),
-                    Err(error) => Some(format!("Could not open the link: {error}")),
-                };
-                if let Some(message) = failure {
-                    app.set_notice(message);
-                    notice_until = Some(Instant::now() + NOTICE_DURATION);
+                if let Some(message) = open_failure(opened) {
+                    notify(&mut app, &mut notice_until, message);
                 }
                 false
+            }
+            joined = async { saving.as_mut().expect("guarded by is_some").await },
+                if saving.is_some() =>
+            {
+                saving = None;
+                let (codes, saved) = joined
+                    .unwrap_or_else(|error| (Vec::new(), Err(anyhow!("the save stopped: {error}"))));
+                let (message, refetch) = apply_saved_regions(&mut app, &mut platforms, codes, saved);
+                notify(&mut app, &mut notice_until, message);
+                refetch
             }
             () = sleep_until(notice_until.unwrap_or_else(Instant::now)), if notice_until.is_some() => {
                 app.clear_notice();
@@ -236,11 +368,25 @@ where
             }
             event = events.recv() => {
                 match event.ok_or_else(|| anyhow!("terminal input stopped"))?? {
-                    Event::Key(key) => match Action::from_key(key).and_then(|action| app.apply(action)) {
+                    Event::Key(key) => match app.key(key) {
                         Some(Effect::Refresh) => true,
                         Some(Effect::Open(url)) => {
                             let launch = open(url.clone());
                             opening.spawn(async move { (url, launch.await) });
+                            false
+                        }
+                        Some(Effect::Notice(message)) => {
+                            notify(&mut app, &mut notice_until, message);
+                            false
+                        }
+                        Some(Effect::SaveAwsRegions(_)) if saving.is_some() => {
+                            let message = "The last save is still running; try again in a moment".to_owned();
+                            notify(&mut app, &mut notice_until, message);
+                            false
+                        }
+                        Some(Effect::SaveAwsRegions(codes)) => {
+                            let saved = save(codes.clone());
+                            saving = Some(tokio::spawn(async move { (codes, saved.await) }));
                             false
                         }
                         None => false,
@@ -252,17 +398,15 @@ where
         };
 
         if app.should_quit() {
-            if let Some(task) = pending {
-                task.abort();
-            }
-            if let Some(task) = reading {
-                task.abort();
-            }
+            stop(pending, reading, saving).await;
             return Ok(());
         }
         if start_refresh {
             // The next automatic refresh comes a full interval after this one.
             ticker.reset();
+            if let Some(task) = pending.take() {
+                task.abort();
+            }
             pending = Some(tokio::spawn(fetch(platforms.clone())));
             if reading.is_none() {
                 reading = Some(tokio::spawn(load_history()));
@@ -285,6 +429,11 @@ mod tests {
     /// A history reader for tests that don't look at history: no file.
     async fn no_history() -> History {
         History::Missing
+    }
+
+    /// A config writer for tests that never save a filter.
+    async fn never_save(codes: Vec<String>) -> Result<String> {
+        panic!("nothing should save {codes:?}");
     }
 
     /// An opener for tests that never press `o`.
@@ -378,7 +527,8 @@ mod tests {
                 &mut events,
                 fetch,
                 never_open,
-                no_history
+                no_history,
+                never_save
             ),
             driver
         );
@@ -444,7 +594,8 @@ mod tests {
                 &mut events,
                 fetch,
                 never_open,
-                no_history
+                no_history,
+                never_save
             ),
             driver
         );
@@ -522,7 +673,8 @@ mod tests {
                 &mut events,
                 fetch_with_incidents,
                 open,
-                no_history
+                no_history,
+                never_save
             ),
             driver
         );
@@ -555,7 +707,8 @@ mod tests {
                 &mut events,
                 fetch_with_incidents,
                 open,
-                no_history
+                no_history,
+                never_save
             ),
             driver
         );
@@ -623,7 +776,8 @@ mod tests {
                 &mut events,
                 fetch_with_incidents,
                 never_open,
-                load_history
+                load_history,
+                never_save
             ),
             driver
         );
@@ -679,7 +833,8 @@ mod tests {
                 &mut events,
                 fetch_with_incidents,
                 never_open,
-                load_history
+                load_history,
+                never_save
             ),
             driver
         );
@@ -691,6 +846,253 @@ mod tests {
         assert!(screen.contains(" 2 changes "), "the reread file: {screen}");
         assert!(screen.contains("GitHub  Outage, ongoing"), "{screen}");
         assert!(screen.contains("Calm    Outage, ongoing"), "{screen}");
+    }
+
+    fn aws_only() -> Vec<Platform> {
+        vec![Platform::new(
+            "AWS",
+            Source::Aws {
+                url: "https://aws.example/currentevents".to_owned(),
+                regions: Some(vec!["us-west-2".to_owned()]),
+            },
+        )]
+    }
+
+    /// A fetcher that reports the AWS regions each fetch was given.
+    fn fetch_reporting_regions(
+        tx: UnboundedSender<Option<Vec<String>>>,
+    ) -> impl Fn(Vec<Platform>) -> std::pin::Pin<Box<dyn Future<Output = Vec<PlatformStatus>> + Send>>
+    {
+        move |platforms: Vec<Platform>| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if let Source::Aws { regions, .. } = &platforms[0].source {
+                    tx.send(regions.clone()).unwrap();
+                }
+                platforms
+                    .iter()
+                    .map(|p| {
+                        let mut status = PlatformStatus::unknown(&p.name, "", Utc::now());
+                        status.level = Level::Operational;
+                        status.error = None;
+                        status
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// `f`, tick us-east-1, Enter: the save gets the picks, its notice shows,
+    /// and a refetch starts at once with the new regions.
+    #[tokio::test(start_paused = true)]
+    async fn saving_the_region_picker_refetches_with_the_new_regions() {
+        let (fetched_tx, mut fetched) = unbounded_channel();
+        let saves = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let save = {
+            let saves = Arc::clone(&saves);
+            move |codes: Vec<String>| {
+                saves.lock().unwrap().push(codes);
+                async { Ok("Saved 2 AWS regions to /tmp/config.toml".to_owned()) }
+            }
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        let (events_tx, mut events) = unbounded_channel();
+        let driver = async {
+            let first = fetched.recv().await.unwrap();
+            assert_eq!(first, Some(vec!["us-west-2".to_owned()]));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            for code in [KeyCode::Char('f'), KeyCode::Char(' '), KeyCode::Enter] {
+                events_tx.send(Ok(key(code))).unwrap();
+            }
+            let second = fetched.recv().await.unwrap();
+            assert_eq!(
+                second,
+                Some(vec!["us-east-1".to_owned(), "us-west-2".to_owned()])
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            events_tx.send(Ok(key(KeyCode::Char('q')))).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            event_loop(
+                &mut terminal,
+                aws_only(),
+                &mut events,
+                fetch_reporting_regions(fetched_tx),
+                never_open,
+                no_history,
+                save
+            ),
+            driver
+        );
+        result.unwrap();
+        assert_eq!(
+            *saves.lock().unwrap(),
+            [vec!["us-east-1".to_owned(), "us-west-2".to_owned()]]
+        );
+        let screen = screen(&terminal);
+        assert!(
+            screen.contains(" Saved 2 AWS regions to /tmp/config.toml"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains(" Platforms "),
+            "the picker closed: {screen}"
+        );
+    }
+
+    /// A slow save does not hold up the loop: `r` still refetches (with the
+    /// old regions) while it runs, and the new regions follow once it ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_keeps_going_while_a_save_runs() {
+        let (fetched_tx, mut fetched) = unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let save = {
+            let release = Arc::clone(&release);
+            move |_: Vec<String>| {
+                let release = Arc::clone(&release);
+                async move {
+                    release.notified().await;
+                    Ok("Saved".to_owned())
+                }
+            }
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        let (events_tx, mut events) = unbounded_channel();
+        let driver = async {
+            fetched.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            for code in [KeyCode::Char('f'), KeyCode::Char(' '), KeyCode::Enter] {
+                events_tx.send(Ok(key(code))).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            events_tx.send(Ok(key(KeyCode::Char('r')))).unwrap();
+            let during = fetched.recv().await.unwrap();
+            assert_eq!(during, Some(vec!["us-west-2".to_owned()]));
+            release.notify_one();
+            let after = fetched.recv().await.unwrap();
+            assert_eq!(
+                after,
+                Some(vec!["us-east-1".to_owned(), "us-west-2".to_owned()])
+            );
+            events_tx.send(Ok(key(KeyCode::Char('q')))).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            event_loop(
+                &mut terminal,
+                aws_only(),
+                &mut events,
+                fetch_reporting_regions(fetched_tx),
+                never_open,
+                no_history,
+                save
+            ),
+            driver
+        );
+        result.unwrap();
+    }
+
+    /// A failed save shows why, starts no refetch, and keeps the old regions
+    /// ticked the next time the picker opens.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_save_keeps_the_old_regions_and_says_why() {
+        let (fetched_tx, mut fetched) = unbounded_channel();
+        let save = |_: Vec<String>| async {
+            Err(anyhow!(
+                "could not write /tmp/config.toml: Permission denied"
+            ))
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        let (events_tx, mut events) = unbounded_channel();
+        let driver = async {
+            fetched.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            for code in [KeyCode::Char('f'), KeyCode::Char(' '), KeyCode::Enter] {
+                events_tx.send(Ok(key(code))).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(fetched.try_recv().is_err(), "no refetch after a failure");
+            events_tx.send(Ok(key(KeyCode::Char('f')))).unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            events_tx.send(Ok(key(KeyCode::Char('q')))).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            event_loop(
+                &mut terminal,
+                aws_only(),
+                &mut events,
+                fetch_reporting_regions(fetched_tx),
+                never_open,
+                no_history,
+                save
+            ),
+            driver
+        );
+        result.unwrap();
+        let screen = screen(&terminal);
+        assert!(
+            screen.contains(
+                " Could not save [aws] regions: could not write /tmp/config.toml: Permission denied"
+            ),
+            "{screen}"
+        );
+        assert!(screen.contains("[ ] us-east-1"), "{screen}");
+        assert!(screen.contains("[x] us-west-2"), "{screen}");
+    }
+
+    /// `f` on a platform with no filter shows a footer notice that clears.
+    #[tokio::test(start_paused = true)]
+    async fn f_on_a_platform_without_a_filter_shows_a_notice() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        let (events_tx, mut events) = unbounded_channel();
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            events_tx.send(Ok(key(KeyCode::Char('f')))).unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            events_tx.send(Ok(key(KeyCode::Char('q')))).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            event_loop(
+                &mut terminal,
+                github_and_calm(),
+                &mut events,
+                fetch_with_incidents,
+                never_open,
+                no_history,
+                never_save
+            ),
+            driver
+        );
+        result.unwrap();
+        let screen = screen(&terminal);
+        assert!(
+            screen.contains(" GitHub can't be filtered (only AWS regions can be picked)"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn saved_notices_name_the_file() {
+        let path = Path::new("/home/me/.config/aretheydown/config.toml");
+        assert_eq!(
+            saved_notice(path, Saved::Created, 1),
+            "Created /home/me/.config/aretheydown/config.toml with 1 AWS region"
+        );
+        assert_eq!(
+            saved_notice(path, Saved::Updated, 3),
+            "Saved 3 AWS regions to /home/me/.config/aretheydown/config.toml"
+        );
+        assert_eq!(
+            saved_notice(path, Saved::Updated, 0),
+            "Removed [aws] regions from /home/me/.config/aretheydown/config.toml: every region counts"
+        );
+        assert_eq!(
+            saved_notice(path, Saved::Unchanged, 0),
+            "Every AWS region already counts: /home/me/.config/aretheydown/config.toml has no [aws] regions"
+        );
+        assert_eq!(
+            saved_notice(path, Saved::Unchanged, 2),
+            "/home/me/.config/aretheydown/config.toml already has these 2 AWS regions"
+        );
     }
 
     #[test]
@@ -729,6 +1131,7 @@ mod tests {
             fetch,
             never_open,
             no_history,
+            never_save,
         )
         .await
         .unwrap_err();

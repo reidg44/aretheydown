@@ -268,6 +268,7 @@ mod tests {
             fetched_at: at(),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 

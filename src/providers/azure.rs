@@ -37,6 +37,7 @@ pub fn parse(name: &str, body: &[u8], fetched_at: DateTime<Utc>) -> Result<Platf
         fetched_at,
         error: None,
         probe: None,
+        regions: Vec::new(),
     })
 }
 

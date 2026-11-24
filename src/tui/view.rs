@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use super::REFRESH_INTERVAL;
 use super::app::{App, DetailViewport, History, STALE_LIMIT, Stale};
 use super::link;
+use super::picker::Picker;
 use super::wrap::wrap;
 use crate::history::{self, Change, TIMELINE_WINDOW};
 use crate::model::{
@@ -45,6 +46,10 @@ pub fn draw(frame: &mut Frame, app: &App, now: DateTime<Utc>) -> DetailViewport 
     frame.render_widget(Paragraph::new(header_line(app)), header);
     frame.render_widget(Paragraph::new(footer_line(app)), footer);
 
+    if let Some(picker) = app.picker() {
+        draw_picker(frame, picker, body);
+        return DetailViewport::default();
+    }
     if app.timeline_open() {
         return draw_timeline(frame, app, body, now);
     }
@@ -80,6 +85,14 @@ fn footer_line(app: &App) -> Line<'static> {
     if let Some(notice) = app.notice() {
         return Line::from(format!(" {notice}")).yellow();
     }
+    if let Some(picker) = app.picker() {
+        let keys = if picker.typing() {
+            " type to filter  ↑/↓ move  Backspace delete  Enter done  Esc clear filter"
+        } else {
+            " ↑/↓ j/k move  Space tick  / filter  Enter save  Esc cancel  q quit"
+        };
+        return Line::from(keys).dark_gray();
+    }
     let refresh = REFRESH_INTERVAL.as_secs();
     if app.timeline_open() {
         return Line::from(format!(
@@ -88,7 +101,7 @@ fn footer_line(app: &App) -> Line<'static> {
         .dark_gray();
     }
     Line::from(format!(
-        " ↑/↓ j/k select  PgUp/PgDn J/K scroll  Tab/⇧Tab incident  o open  s sort: {}  t timeline  r refresh  q quit  (auto-refresh every {refresh}s)",
+        " ↑/↓ j/k select  PgUp/PgDn J/K scroll  Tab/⇧Tab incident  o open  f filter  s sort: {}  t timeline  r refresh  q quit  (auto-refresh every {refresh}s)",
         app.sort_order().label(),
     ))
     .dark_gray()
@@ -260,6 +273,70 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: DateTime<Utc>) -
     let block = with_more_hints(block, scroll, &viewport);
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
     viewport
+}
+
+/// Draw the filter picker over `area`: a filter line while one is typed or
+/// set, then one `[x] key  label` row per item it shows, the cursor's row
+/// highlighted, with the ticked count on the border.
+fn draw_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
+    let ticked = picker.items().iter().filter(|item| item.ticked).count();
+    let block = Block::bordered()
+        .title(format!(" {} ", picker.title()))
+        .title_top(
+            Line::from(format!(" {ticked} of {} ticked ", picker.items().len())).right_aligned(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let show_filter = picker.typing() || !picker.filter().is_empty();
+    let [filter_area, list_area] = Layout::vertical([
+        Constraint::Length(u16::from(show_filter) * 2),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    if show_filter {
+        let mut spans = vec![
+            Span::from("Filter: ").dark_gray(),
+            Span::from(picker.filter().to_owned()),
+        ];
+        if picker.typing() {
+            spans.push(Span::from("▏").yellow());
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), filter_area);
+    }
+
+    let visible = picker.visible();
+    if visible.is_empty() {
+        let message = format!("No {} match {:?}.", picker.noun(), picker.filter().trim());
+        frame.render_widget(Paragraph::new(Line::from(message).dark_gray()), list_area);
+        return;
+    }
+    let key_width = visible
+        .iter()
+        .map(|&index| picker.items()[index].key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let items: Vec<ListItem> = visible
+        .iter()
+        .map(|&index| {
+            let item = &picker.items()[index];
+            let mark = if item.ticked {
+                Span::from("[x] ").green()
+            } else {
+                Span::from("[ ] ")
+            };
+            ListItem::new(Line::from(vec![
+                mark,
+                Span::from(format!("{:key_width$}  ", item.key)),
+                Span::from(item.label.clone()).dark_gray(),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(picker.cursor()));
+    frame.render_stateful_widget(list, list_area, &mut state);
 }
 
 /// `block` with ` ↑ more ` on its top border when `scroll` hides lines above,
@@ -773,6 +850,7 @@ mod tests {
             fetched_at: at(19, 10),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 
@@ -1139,7 +1217,7 @@ mod tests {
         let screen_text = screen(&render_sized(&mut app, 140, 24));
         assert!(
             screen_text.contains(
-                "↑/↓ j/k select  PgUp/PgDn J/K scroll  Tab/⇧Tab incident  o open  s sort: worst first  t timeline  r refresh  q quit"
+                "↑/↓ j/k select  PgUp/PgDn J/K scroll  Tab/⇧Tab incident  o open  f filter  s sort: worst first  t timeline  r refresh  q quit"
             ),
             "{screen_text}"
         );
@@ -2111,5 +2189,60 @@ mod tests {
         let screen = screen(&render_sized(&mut app, 140, 24));
         assert!(screen.contains(" Platforms "), "back to the list");
         assert!(screen.contains("t timeline"), "{screen}");
+    }
+
+    fn type_keys(app: &mut App, text: &str) {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for c in text.chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn the_picker_screen_lists_regions_with_ticks_and_a_filter_line() {
+        use crate::tui::app::Filter;
+        let mut app = App::new(vec!["AWS".into()]);
+        app.set_filter("AWS", Filter::AwsRegions(Some(vec!["us-west-2".into()])));
+        type_keys(&mut app, "f");
+        let total = crate::providers::aws::REGIONS.len();
+        let text = screen(&render_sized(&mut app, 100, 12));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("┌ AWS regions "), "{text}");
+        assert!(
+            lines[1].contains(&format!(" 1 of {total} ticked ")),
+            "{text}"
+        );
+        assert!(
+            !text.contains(" Platforms "),
+            "the picker covers the list: {text}"
+        );
+        assert!(
+            lines[2].starts_with("│> [ ] us-east-1       US East (N. Virginia)"),
+            "{text}"
+        );
+        assert!(
+            lines[5].starts_with("│  [x] us-west-2       US West (Oregon)"),
+            "{text}"
+        );
+        assert!(
+            lines[11]
+                .starts_with(" ↑/↓ j/k move  Space tick  / filter  Enter save  Esc cancel  q quit"),
+            "{text}"
+        );
+
+        type_keys(&mut app, "/IRE");
+        let text = screen(&render_sized(&mut app, 100, 12));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with("│Filter: IRE▏"), "{text}");
+        assert!(
+            lines[4].starts_with("│> [ ] eu-west-1  Europe (Ireland)"),
+            "{text}"
+        );
+        assert!(lines[5].starts_with("│     "), "only one match: {text}");
+        assert!(lines[11].starts_with(" type to filter"), "{text}");
+
+        type_keys(&mut app, "zz");
+        let text = screen(&render_sized(&mut app, 100, 12));
+        assert!(text.contains("No regions match \"IREzz\"."), "{text}");
     }
 }

@@ -196,7 +196,8 @@ async fn main() -> ExitCode {
     }
 
     if !cli.once {
-        return match tui::run(client, loaded.platforms, cli.history_path()).await {
+        let config_path = cli.config.clone().or_else(config::default_path);
+        return match tui::run(client, loaded.platforms, cli.history_path(), config_path).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error:#}");
@@ -230,6 +231,7 @@ mod tests {
             fetched_at: Utc::now(),
             error: None,
             probe: None,
+            regions: Vec::new(),
         }
     }
 
