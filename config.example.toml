@@ -74,7 +74,7 @@
 # Probes: every refresh, one GET of each vendor's own service (not its status
 # page), shown next to the vendor's level as a check mark or cross. A probe
 # never changes the level, verdict, exit code, history, or alerts. Every
-# built-in has one (README -> Probes lists them). Key = platform name (not
+# built-in has one (docs/probes.md lists them). Key = platform name (not
 # case-sensitive); value = false (no probe) or a table with:
 #   url:    the URL to GET (http or https; redirects are NOT followed)
 #   expect: the status that means up: a code (401) or a class ("3xx"); a url
